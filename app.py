@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn", "geopandas", "pyarrow", "h3"]
-# ///
 """Homes England investment decision engine — PoC backend.
 
 Run: uv run app.py  ->  http://localhost:8000
@@ -18,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sklearn.cluster import KMeans
 
 HERE = Path(__file__).parent
 gdf = gpd.read_parquet(HERE / "london_physical_features.geoparquet")
@@ -125,18 +122,40 @@ class Weights(BaseModel):
     level: str = str(BASE_RES)
 
 
-@app.post("/score")
-def score(body: Weights):
+def weight_vector(weights):
     w = np.zeros(len(FEATURES))
-    for k, v in body.weights.items():
+    for k, v in weights.items():
         if k in IDX:
             w[IDX[k]] = v
+    return w
+
+
+@app.post("/score")
+def score(body: Weights):
+    w = weight_vector(body.weights)
     norm = LEVELS[body.level]["norm"]
     if not w.any():
         return {"pct": [0.5] * len(norm)}
     s = norm @ w
     pct = pd.Series(s).rank(pct=True).to_numpy()
     return {"pct": np.round(pct, 4).tolist()}
+
+
+class ClusterRequest(Weights):
+    n_clusters: int = 5
+
+
+@app.post("/cluster")
+def cluster(body: ClusterRequest):
+    # Vector per zone = percentiles of the features switched on (weights are ignored).
+    X = LEVELS[body.level]["norm"][:, [IDX[k] for k in body.weights if k in IDX]]
+    k = max(1, min(body.n_clusters, len(X)))
+    if X.shape[1] == 0 or k == 1:
+        return {"labels": [0] * len(X)}
+    labels = KMeans(n_clusters=k).fit_predict(X)
+    # K-means label ids are arbitrary; renumber by cluster size so colours stay stable between runs.
+    order = np.argsort(-np.bincount(labels, minlength=k))
+    return {"labels": np.argsort(order)[labels].tolist()}
 
 
 if __name__ == "__main__":

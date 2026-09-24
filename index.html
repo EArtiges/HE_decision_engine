@@ -27,6 +27,12 @@
   .seg span { padding: 6px 10px; color: var(--muted); }
   .seg button { border: 0; border-left: 1px solid var(--line); border-radius: 0; color: var(--muted); }
   .seg button.on { background: var(--accent); color: #fff; }
+  .kctl { display: flex; align-items: center; gap: 10px; margin-top: 12px; color: var(--muted); }
+  .kctl input { flex: 1; accent-color: var(--accent); }
+  .kctl b { color: var(--text); font-weight: 500; width: 16px; text-align: right; font-variant-numeric: tabular-nums; }
+  .swatches { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .swatches i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  [hidden] { display: none !important; }
   #features { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
   h2 { margin: 18px 20px 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
   .f { padding: 7px 20px; }
@@ -52,10 +58,13 @@
 <aside>
   <header>
     <h1>Homes England investment decision engine</h1>
-    <p>Score = Σ weight × feature percentile, shown as percentile across London.</p>
-    <div class="legend"><div class="bar"></div><div class="ticks"><span>0th</span><span>50th</span><span>100th</span></div></div>
+    <p id="desc"></p>
+    <div class="legend" id="legend-score"><div class="bar"></div><div class="ticks"><span>0th</span><span>50th</span><span>100th</span></div></div>
+    <div class="legend swatches" id="legend-cluster" hidden></div>
     <div class="actions"><button id="reset">Reset</button><button id="clear">Clear all</button><button id="basemap">Light map</button></div>
     <div class="seg" id="res"><span>Zones</span></div>
+    <div class="seg" id="mode"><button data-mode="score" class="on">Scores</button><button data-mode="cluster">Cluster areas</button></div>
+    <div class="kctl" id="kctl" hidden><span>Clusters</span><input type="range" id="k" min="1" max="10" value="5"><b id="kval">5</b></div>
   </header>
   <div id="features"></div>
 </aside>
@@ -63,11 +72,18 @@
 
 <script>
 const state = {};          // key -> {on, w}
-let features, cells, raw, pct, level, baseLevel, version = 0;
+let features, cells, raw, vals, level, baseLevel, mode = 'score', version = 0;   // vals: percentile or cluster id per zone
+const DESC = {
+  score: 'Score = Σ weight × feature percentile, shown as percentile across London.',
+  cluster: 'K-means on the percentiles of the features switched on (weights ignored).',
+};
 
 const RED = [215, 48, 39], WHITE = [255, 255, 255], GREEN = [26, 152, 80];
 const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
-const color = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p - 0.5) * 2);
+const scoreColor = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p - 0.5) * 2);
+const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+  .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+const color = v => mode === 'cluster' ? TAB10[v % 10] : scoreColor(v);
 
 const map = new deck.DeckGL({
   container: 'map',
@@ -77,7 +93,7 @@ const map = new deck.DeckGL({
   getTooltip: ({ object: d }) => d && {
     className: 'tip',
     style: { background: '#0c0f13ee', border: '1px solid #262c35', borderRadius: '6px', padding: '10px 12px' },
-    html: `<b>${Math.round(pct[d.i] * 100)}th percentile</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
+    html: `<b>${mode === 'cluster' ? `Cluster ${vals[d.i] + 1}` : `${Math.round(vals[d.i] * 100)}th percentile`}</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
       features.filter(f => state[f.key].on).map(f =>
         `<tr><td>${f.label}${level !== baseLevel ? ` <i style="color:#5c6573">${f.agg}</i>` : ''}</td><td>${raw[d.i][f.col].toLocaleString()}</td></tr>`).join('') + '</table>'
   },
@@ -87,26 +103,35 @@ function render() {
   map.setProps({ layers: [new deck.PolygonLayer({
     id: 'cells', data: cells,
     getPolygon: d => d.poly,
-    getFillColor: d => color(pct[d.i]),
+    getFillColor: d => color(vals[d.i]),
     getLineColor: [0, 0, 0, 60], lineWidthMinPixels: 0.5,
     opacity: 0.5, pickable: true, autoHighlight: true, highlightColor: [255, 255, 255, 90],
     updateTriggers: { getFillColor: version },
     transitions: { getFillColor: 250 },
   })] });
+  if (mode === 'cluster') {
+    const counts = vals.reduce((c, v) => (c[v] = (c[v] || 0) + 1, c), []);
+    document.getElementById('legend-cluster').innerHTML = counts.map((n, c) =>
+      `<span><i style="background:rgb(${TAB10[c % 10]})"></i>${c + 1} · ${n}</span>`).join('');
+  }
 }
 
 // Latest-wins request coalescing: never more than one request in flight.
 let inflight = false, queued = false;
-async function fetchScore(level) {
+async function fetchValues(level, mode) {
   const weights = Object.fromEntries(Object.entries(state).filter(([, s]) => s.on).map(([k, s]) => [k, s.w]));
-  const r = await fetch('/score', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weights, level }) });
-  return (await r.json()).pct;
+  const n_clusters = +document.getElementById('k').value;
+  const r = await fetch(mode === 'cluster' ? '/cluster' : '/score', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weights, level, n_clusters }),
+  });
+  const j = await r.json();
+  return mode === 'cluster' ? j.labels : j.pct;
 }
 async function update() {
   if (inflight) { queued = true; return; }
   inflight = true;
-  const l = level, p = await fetchScore(l);
-  if (l === level) { pct = p; version++; render(); }
+  const [l, m] = [level, mode], v = await fetchValues(l, m);
+  if (l === level && m === mode) { vals = v; version++; render(); }
   inflight = false;
   if (queued) { queued = false; update(); }
 }
@@ -123,7 +148,7 @@ function buildSidebar() {
       <input type="range" min="-1" max="1" step="0.05" value="${s.w}">`;
     const [tog, wEl, slider] = [row.querySelector('.sw'), row.querySelector('.w'), row.querySelector('input[type=range]')];
     tog.onchange = () => { s.on = tog.checked; row.classList.toggle('off', !s.on); update(); };
-    slider.oninput = () => { s.w = +slider.value; wEl.textContent = s.w.toFixed(2); update(); };
+    slider.oninput = () => { s.w = +slider.value; wEl.textContent = s.w.toFixed(2); if (mode === 'score') update(); };
     el.appendChild(row);
   });
 }
@@ -148,11 +173,24 @@ document.getElementById('basemap').onclick = e => {
 // A zone can have several polygons (e.g. boroughs split by the Thames); each points back to its zone index i.
 const flatten = zones => zones.flatMap((z, i) => z.polys.map(poly => ({ id: z.id, poly, i })));
 async function setLevel(l) {
-  const [m, p] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchScore(l)]);
-  level = l; raw = m.raw; cells = flatten(m.cells); pct = p; version++;
+  const [m, v] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchValues(l, mode)]);
+  level = l; raw = m.raw; cells = flatten(m.cells); vals = v; version++;
   document.querySelectorAll('#res button').forEach(b => b.classList.toggle('on', b.dataset.level === l));
   render();
 }
+
+async function setMode(m) {
+  const v = await fetchValues(level, m);
+  mode = m; vals = v; version++;
+  document.querySelectorAll('#mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+  document.getElementById('legend-score').hidden = m !== 'score';
+  document.getElementById('legend-cluster').hidden = document.getElementById('kctl').hidden = m !== 'cluster';
+  document.getElementById('desc').textContent = DESC[m];
+  render();
+}
+document.querySelectorAll('#mode button').forEach(b => b.onclick = () => setMode(b.dataset.mode));
+document.getElementById('k').oninput = e => { document.getElementById('kval').textContent = e.target.value; update(); };
+document.getElementById('desc').textContent = DESC.score;
 
 fetch('/meta').then(r => r.json()).then(m => {
   baseLevel = level = m.levels[0];
@@ -164,7 +202,7 @@ fetch('/meta').then(r => r.json()).then(m => {
   const groups = ['Core', 'Amenities (POI count)', 'Nearby landmarks (500m)', 'Streets & cycling'];
   features = m.features.map((f, col) => ({ ...f, col })).sort((a, b) => groups.indexOf(a.group) - groups.indexOf(b.group) || a.col - b.col);
   raw = m.raw; cells = flatten(m.cells);
-  pct = cells.map(() => 0.5);
+  vals = cells.map(() => 0.5);
   setDefaults(false);
 });
 </script>
