@@ -148,14 +148,19 @@ class ClusterRequest(Weights):
 @app.post("/cluster")
 def cluster(body: ClusterRequest):
     # Vector per zone = percentiles of the features switched on (weights are ignored).
-    X = LEVELS[body.level]["norm"][:, [IDX[k] for k in body.weights if k in IDX]]
+    keys = [k for k in body.weights if k in IDX]
+    X = LEVELS[body.level]["norm"][:, [IDX[k] for k in keys]]
     k = max(1, min(body.n_clusters, len(X)))
-    if X.shape[1] == 0 or k == 1:
-        return {"labels": [0] * len(X)}
-    labels = KMeans(n_clusters=k).fit_predict(X)
+    if not keys or k == 1:
+        return {"labels": [0] * len(X), "keys": keys, "centers": [np.round(X.mean(0) * 100, 1).tolist()]}
+    km = KMeans(n_clusters=k).fit(X)
     # K-means label ids are arbitrary; renumber by cluster size so colours stay stable between runs.
-    order = np.argsort(-np.bincount(labels, minlength=k))
-    return {"labels": np.argsort(order)[labels].tolist()}
+    order = np.argsort(-np.bincount(km.labels_, minlength=k))
+    return {
+        "labels": np.argsort(order)[km.labels_].tolist(),
+        "keys": keys,
+        "centers": np.round(km.cluster_centers_[order] * 100, 1).tolist(),  # [cluster][feature], percentile 0-100
+    }
 
 
 if __name__ == "__main__":

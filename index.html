@@ -33,6 +33,15 @@
   .swatches { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .swatches i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
   [hidden] { display: none !important; }
+  #profile { position: absolute; right: 12px; bottom: 36px; z-index: 1; max-height: calc(100% - 60px); overflow: auto;
+    background: #171b21ee; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 11px; }
+  #profile h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  #profile table { border-collapse: separate; border-spacing: 2px; }
+  #profile th { font-weight: 500; color: var(--muted); padding: 0 4px 4px; cursor: default; white-space: nowrap; }
+  #profile th i { display: block; height: 4px; border-radius: 2px; margin-bottom: 4px; }
+  #profile td { padding: 3px 6px; text-align: center; font-variant-numeric: tabular-nums; border-radius: 3px; min-width: 32px; transition: opacity .15s; }
+  #profile td:first-child { text-align: left; color: var(--text); background: none; padding-left: 0; white-space: nowrap; }
+  #profile .dim { opacity: 0.25; }
   #features { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
   h2 { margin: 18px 20px 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
   .f { padding: 7px 20px; }
@@ -68,11 +77,11 @@
   </header>
   <div id="features"></div>
 </aside>
-<div id="map"></div>
+<div id="map"><div id="profile" hidden></div></div>
 
 <script>
 const state = {};          // key -> {on, w}
-let features, cells, raw, vals, level, baseLevel, mode = 'score', version = 0;   // vals: percentile or cluster id per zone
+let features, cells, raw, vals, profile, highlight = null, level, baseLevel, mode = 'score', version = 0;   // vals: percentile or cluster id per zone
 const DESC = {
   score: 'Score = Σ weight × feature percentile, shown as percentile across London.',
   cluster: 'K-means on the percentiles of the features switched on (weights ignored).',
@@ -83,7 +92,7 @@ const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const scoreColor = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p - 0.5) * 2);
 const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
   .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
-const color = v => mode === 'cluster' ? TAB10[v % 10] : scoreColor(v);
+const color = v => mode === 'cluster' ? [...TAB10[v % 10], highlight === null || highlight === v ? 255 : 25] : scoreColor(v);
 
 const map = new deck.DeckGL({
   container: 'map',
@@ -106,7 +115,7 @@ function render() {
     getFillColor: d => color(vals[d.i]),
     getLineColor: [0, 0, 0, 60], lineWidthMinPixels: 0.5,
     opacity: 0.5, pickable: true, autoHighlight: true, highlightColor: [255, 255, 255, 90],
-    updateTriggers: { getFillColor: version },
+    updateTriggers: { getFillColor: [version, highlight] },
     transitions: { getFillColor: 250 },
   })] });
   if (mode === 'cluster') {
@@ -114,7 +123,29 @@ function render() {
     document.getElementById('legend-cluster').innerHTML = counts.map((n, c) =>
       `<span><i style="background:rgb(${TAB10[c % 10]})"></i>${c + 1} · ${n}</span>`).join('');
   }
+  renderProfile();
 }
+
+// Cluster profiles: rows = switched-on features, columns = clusters, cell = centre percentile (50 = London median).
+function renderProfile() {
+  const el = document.getElementById('profile');
+  el.hidden = mode !== 'cluster' || !profile || !profile.keys.length;
+  if (el.hidden) return;
+  const counts = vals.reduce((c, v) => (c[v] = (c[v] || 0) + 1, c), []);
+  const rows = features.filter(f => profile.keys.includes(f.key));
+  const dim = c => highlight !== null && highlight !== c ? ' class="dim"' : '';
+  el.innerHTML = `<h3>Cluster profiles · centre percentile</h3><table><tr><th></th>` +
+    profile.centers.map((_, c) => `<th data-c="${c}"${dim(c)}><i style="background:rgb(${TAB10[c % 10]})"></i>${c + 1} (${counts[c] || 0})</th>`).join('') + '</tr>' +
+    rows.map(f => { const j = profile.keys.indexOf(f.key); return `<tr><td>${f.label}</td>` + profile.centers.map((ctr, c) => {
+      const v = ctr[j];
+      return `<td data-c="${c}"${dim(c)} style="background:rgb(${scoreColor(v / 100)});color:${Math.abs(v - 50) > 30 ? '#fff' : '#111'}">${Math.round(v)}</td>`;
+    }).join('') + '</tr>'; }).join('') + '</table>';
+}
+// Hovering a cluster column fades the other clusters on the map.
+const profileEl = document.getElementById('profile');
+profileEl.addEventListener('mouseover', e => { const c = e.target.closest('[data-c]'); setHighlight(c ? +c.dataset.c : null); });
+profileEl.addEventListener('mouseleave', () => setHighlight(null));
+function setHighlight(c) { if (c !== highlight) { highlight = c; render(); } }
 
 // Latest-wins request coalescing: never more than one request in flight.
 let inflight = false, queued = false;
@@ -124,14 +155,14 @@ async function fetchValues(level, mode) {
   const r = await fetch(mode === 'cluster' ? '/cluster' : '/score', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weights, level, n_clusters }),
   });
-  const j = await r.json();
-  return mode === 'cluster' ? j.labels : j.pct;
+  return r.json();
 }
+function apply(m, j) { vals = m === 'cluster' ? j.labels : j.pct; profile = m === 'cluster' ? j : null; version++; }
 async function update() {
   if (inflight) { queued = true; return; }
   inflight = true;
-  const [l, m] = [level, mode], v = await fetchValues(l, m);
-  if (l === level && m === mode) { vals = v; version++; render(); }
+  const [l, m] = [level, mode], j = await fetchValues(l, m);
+  if (l === level && m === mode) { apply(m, j); render(); }
   inflight = false;
   if (queued) { queued = false; update(); }
 }
@@ -173,15 +204,15 @@ document.getElementById('basemap').onclick = e => {
 // A zone can have several polygons (e.g. boroughs split by the Thames); each points back to its zone index i.
 const flatten = zones => zones.flatMap((z, i) => z.polys.map(poly => ({ id: z.id, poly, i })));
 async function setLevel(l) {
-  const [m, v] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchValues(l, mode)]);
-  level = l; raw = m.raw; cells = flatten(m.cells); vals = v; version++;
+  const [m, j] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchValues(l, mode)]);
+  level = l; raw = m.raw; cells = flatten(m.cells); apply(mode, j);
   document.querySelectorAll('#res button').forEach(b => b.classList.toggle('on', b.dataset.level === l));
   render();
 }
 
 async function setMode(m) {
-  const v = await fetchValues(level, m);
-  mode = m; vals = v; version++;
+  const j = await fetchValues(level, m);
+  mode = m; highlight = null; apply(m, j);
   document.querySelectorAll('#mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   document.getElementById('legend-score').hidden = m !== 'score';
   document.getElementById('legend-cluster').hidden = document.getElementById('kctl').hidden = m !== 'cluster';
