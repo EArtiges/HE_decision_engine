@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Homes England investment decision engine</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/deck.gl@9.1.14/dist.min.js"></script>
+<style>
+  :root { --bg: #111418; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --muted: #8a93a3; --accent: #4fb477; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 Inter, system-ui, sans-serif; }
+  body { display: flex; }
+  aside { width: 340px; height: 100%; display: flex; flex-direction: column; background: var(--panel); border-right: 1px solid var(--line); }
+  header { padding: 20px 20px 14px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 4px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+  header p { margin: 0; color: var(--muted); font-size: 12px; }
+  .legend { margin-top: 14px; }
+  .legend .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #d73027, #ffffff, #1a9850); }
+  .legend .ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .actions { display: flex; gap: 8px; margin-top: 14px; }
+  button { flex: 1; background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  .seg { display: flex; margin-top: 14px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg span { padding: 6px 10px; color: var(--muted); }
+  .seg button { border: 0; border-left: 1px solid var(--line); border-radius: 0; color: var(--muted); }
+  .seg button.on { background: var(--accent); color: #fff; }
+  #features { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
+  h2 { margin: 18px 20px 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .f { padding: 7px 20px; }
+  .f .top { display: flex; align-items: center; gap: 10px; }
+  .f label { flex: 1; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .f .w { font-variant-numeric: tabular-nums; color: var(--muted); width: 38px; text-align: right; }
+  .f.off label, .f.off .w { color: #5c6573; }
+  .f input[type=range] { width: 100%; margin: 6px 0 0; accent-color: var(--accent); display: none; }
+  .f:not(.off) input[type=range] { display: block; }
+  .sw { appearance: none; width: 28px; height: 16px; border-radius: 8px; background: #333a45; position: relative; cursor: pointer; margin: 0; flex: none; transition: background .15s; }
+  .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #cfd5de; transition: transform .15s; }
+  .sw:checked { background: var(--accent); }
+  .sw:checked::after { transform: translateX(12px); background: #fff; }
+  #map { position: relative; flex: 1; }
+  .tip { font: 12px/1.5 Inter, system-ui, sans-serif; }
+  .tip b { font-size: 14px; }
+  .tip table { border-spacing: 0; margin-top: 4px; }
+  .tip td { padding: 0 0 0 12px; text-align: right; font-variant-numeric: tabular-nums; }
+  .tip td:first-child { padding: 0; text-align: left; color: #aab2bf; }
+</style>
+</head>
+<body>
+<aside>
+  <header>
+    <h1>Homes England investment decision engine</h1>
+    <p>Score = Σ weight × feature percentile, shown as percentile across London.</p>
+    <div class="legend"><div class="bar"></div><div class="ticks"><span>0th</span><span>50th</span><span>100th</span></div></div>
+    <div class="actions"><button id="reset">Reset</button><button id="clear">Clear all</button><button id="basemap">Light map</button></div>
+    <div class="seg" id="res"><span>Zones</span></div>
+  </header>
+  <div id="features"></div>
+</aside>
+<div id="map"></div>
+
+<script>
+const state = {};          // key -> {on, w}
+let features, cells, raw, pct, level, baseLevel, version = 0;
+
+const RED = [215, 48, 39], WHITE = [255, 255, 255], GREEN = [26, 152, 80];
+const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+const color = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p - 0.5) * 2);
+
+const map = new deck.DeckGL({
+  container: 'map',
+  mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+  initialViewState: { longitude: -0.11, latitude: 51.5, zoom: 9.7 },
+  controller: true,
+  getTooltip: ({ object: d }) => d && {
+    className: 'tip',
+    style: { background: '#0c0f13ee', border: '1px solid #262c35', borderRadius: '6px', padding: '10px 12px' },
+    html: `<b>${Math.round(pct[d.i] * 100)}th percentile</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
+      features.filter(f => state[f.key].on).map(f =>
+        `<tr><td>${f.label}${level !== baseLevel ? ` <i style="color:#5c6573">${f.agg}</i>` : ''}</td><td>${raw[d.i][f.col].toLocaleString()}</td></tr>`).join('') + '</table>'
+  },
+});
+
+function render() {
+  map.setProps({ layers: [new deck.PolygonLayer({
+    id: 'cells', data: cells,
+    getPolygon: d => d.poly,
+    getFillColor: d => color(pct[d.i]),
+    getLineColor: [0, 0, 0, 60], lineWidthMinPixels: 0.5,
+    opacity: 0.5, pickable: true, autoHighlight: true, highlightColor: [255, 255, 255, 90],
+    updateTriggers: { getFillColor: version },
+    transitions: { getFillColor: 250 },
+  })] });
+}
+
+// Latest-wins request coalescing: never more than one request in flight.
+let inflight = false, queued = false;
+async function fetchScore(level) {
+  const weights = Object.fromEntries(Object.entries(state).filter(([, s]) => s.on).map(([k, s]) => [k, s.w]));
+  const r = await fetch('/score', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weights, level }) });
+  return (await r.json()).pct;
+}
+async function update() {
+  if (inflight) { queued = true; return; }
+  inflight = true;
+  const l = level, p = await fetchScore(l);
+  if (l === level) { pct = p; version++; render(); }
+  inflight = false;
+  if (queued) { queued = false; update(); }
+}
+
+function buildSidebar() {
+  const el = document.getElementById('features'); el.innerHTML = '';
+  let g;
+  features.forEach(f => {
+    if (f.group !== g) { g = f.group; el.insertAdjacentHTML('beforeend', `<h2>${g}</h2>`); }
+    const s = state[f.key], row = document.createElement('div');
+    row.className = 'f' + (s.on ? '' : ' off');
+    row.innerHTML = `<div class="top"><input type="checkbox" class="sw" id="t-${f.key}" ${s.on ? 'checked' : ''}>
+      <label for="t-${f.key}" title="${f.key}">${f.label}</label><span class="w">${s.w.toFixed(2)}</span></div>
+      <input type="range" min="-1" max="1" step="0.05" value="${s.w}">`;
+    const [tog, wEl, slider] = [row.querySelector('.sw'), row.querySelector('.w'), row.querySelector('input[type=range]')];
+    tog.onchange = () => { s.on = tog.checked; row.classList.toggle('off', !s.on); update(); };
+    slider.oninput = () => { s.w = +slider.value; wEl.textContent = s.w.toFixed(2); update(); };
+    el.appendChild(row);
+  });
+}
+
+function setDefaults(clear) {
+  features.forEach(f => state[f.key] = { on: !clear && f.default != null, w: clear ? 0.5 : (f.default ?? 0.5) });
+  buildSidebar(); update();
+}
+
+document.getElementById('reset').onclick = () => setDefaults(false);
+document.getElementById('clear').onclick = () => setDefaults(true);
+
+const BASEMAPS = { dark: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json', light: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json' };
+let basemap = 'dark';
+document.getElementById('basemap').onclick = e => {
+  basemap = basemap === 'dark' ? 'light' : 'dark';
+  e.target.textContent = basemap === 'dark' ? 'Light map' : 'Dark map';
+  map.setProps({ mapStyle: BASEMAPS[basemap] });
+};
+
+// Swap cells, raw values and scores in one go so the map never shows a mismatched frame.
+// A zone can have several polygons (e.g. boroughs split by the Thames); each points back to its zone index i.
+const flatten = zones => zones.flatMap((z, i) => z.polys.map(poly => ({ id: z.id, poly, i })));
+async function setLevel(l) {
+  const [m, p] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchScore(l)]);
+  level = l; raw = m.raw; cells = flatten(m.cells); pct = p; version++;
+  document.querySelectorAll('#res button').forEach(b => b.classList.toggle('on', b.dataset.level === l));
+  render();
+}
+
+fetch('/meta').then(r => r.json()).then(m => {
+  baseLevel = level = m.levels[0];
+  m.levels.forEach(l => {
+    const b = document.createElement('button'); b.dataset.level = l; b.textContent = l === 'boroughs' ? 'Boroughs' : `H3 ${l}`;
+    b.className = l === level ? 'on' : ''; b.onclick = () => setLevel(l);
+    document.getElementById('res').appendChild(b);
+  });
+  const groups = ['Core', 'Amenities (POI count)', 'Nearby landmarks (500m)', 'Streets & cycling'];
+  features = m.features.map((f, col) => ({ ...f, col })).sort((a, b) => groups.indexOf(a.group) - groups.indexOf(b.group) || a.col - b.col);
+  raw = m.raw; cells = flatten(m.cells);
+  pct = cells.map(() => 0.5);
+  setDefaults(false);
+});
+</script>
+</body>
+</html>
