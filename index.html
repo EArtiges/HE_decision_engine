@@ -44,10 +44,11 @@
   #profile .dim { opacity: 0.25; }
   #features { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
   h2 { margin: 18px 20px 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  h2 .count { float: right; text-transform: none; letter-spacing: 0; font-weight: 400; }
   .f { padding: 7px 20px; }
   .f .top { display: flex; align-items: center; gap: 10px; }
   .f label { flex: 1; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .f .w { font-variant-numeric: tabular-nums; color: var(--muted); width: 38px; text-align: right; }
+  .f .w { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 38px; text-align: right; white-space: nowrap; }
   .f.off label, .f.off .w { color: #5c6573; }
   .f input[type=range] { width: 100%; margin: 6px 0 0; accent-color: var(--accent); display: none; }
   .f:not(.off) input[type=range] { display: block; }
@@ -81,9 +82,11 @@
 
 <script>
 const state = {};          // key -> {on, w}
-let features, cells, raw, vals, profile, highlight = null, level, baseLevel, mode = 'score', version = 0;   // vals: percentile or cluster id per zone
+const excl = {};          // hard exclusion layer key -> {on, t}: excluded if coverage >= t
+let exclusions, excludedCount = 0;
+let features, cells, raw, cov, vals, profile, highlight = null, level, baseLevel, mode = 'score', version = 0;   // vals: percentile or cluster id per zone
 const DESC = {
-  score: 'Score = Σ weight × feature percentile, shown as percentile across London.',
+  score: 'Score = Σ weight × feature percentile, shown as percentile among non-excluded zones.',
   cluster: 'K-means on the percentiles of the features switched on (weights ignored).',
 };
 
@@ -92,7 +95,8 @@ const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const scoreColor = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p - 0.5) * 2);
 const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
   .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
-const color = v => mode === 'cluster' ? [...TAB10[v % 10], highlight === null || highlight === v ? 255 : 25] : scoreColor(v);
+const EXCLUDED = [110, 116, 128, 70];
+const color = v => v === null ? EXCLUDED : mode === 'cluster' ? [...TAB10[v % 10], highlight === null || highlight === v ? 255 : 25] : scoreColor(v);
 
 const map = new deck.DeckGL({
   container: 'map',
@@ -102,7 +106,9 @@ const map = new deck.DeckGL({
   getTooltip: ({ object: d }) => d && {
     className: 'tip',
     style: { background: '#0c0f13ee', border: '1px solid #262c35', borderRadius: '6px', padding: '10px 12px' },
-    html: `<b>${mode === 'cluster' ? `Cluster ${vals[d.i] + 1}` : `${Math.round(vals[d.i] * 100)}th percentile`}</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
+    html: `<b>${vals[d.i] === null ? 'Excluded' : mode === 'cluster' ? `Cluster ${vals[d.i] + 1}` : `${Math.round(vals[d.i] * 100)}th percentile`}</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
+      exclusions.filter(x => cov[x.key][d.i] > 0).map(x =>
+        `<tr><td>${x.label} <i style="color:#5c6573">coverage</i></td><td>${Math.round(cov[x.key][d.i] * 100)}%</td></tr>`).join('') +
       features.filter(f => state[f.key].on).map(f =>
         `<tr><td>${f.label}${level !== baseLevel ? ` <i style="color:#5c6573">${f.agg}</i>` : ''}</td><td>${raw[d.i][f.col].toLocaleString()}</td></tr>`).join('') + '</table>'
   },
@@ -119,11 +125,13 @@ function render() {
     transitions: { getFillColor: 250 },
   })] });
   if (mode === 'cluster') {
-    const counts = vals.reduce((c, v) => (c[v] = (c[v] || 0) + 1, c), []);
+    const counts = vals.reduce((c, v) => (v !== null && (c[v] = (c[v] || 0) + 1), c), []);
     document.getElementById('legend-cluster').innerHTML = counts.map((n, c) =>
       `<span><i style="background:rgb(${TAB10[c % 10]})"></i>${c + 1} · ${n}</span>`).join('');
   }
   renderProfile();
+  const n = document.getElementById('excl-count');
+  if (n) n.textContent = `${excludedCount.toLocaleString()} of ${vals.length.toLocaleString()} excluded`;
 }
 
 // Cluster profiles: rows = switched-on features, columns = clusters, cell = centre percentile (50 = London median).
@@ -131,7 +139,7 @@ function renderProfile() {
   const el = document.getElementById('profile');
   el.hidden = mode !== 'cluster' || !profile || !profile.keys.length;
   if (el.hidden) return;
-  const counts = vals.reduce((c, v) => (c[v] = (c[v] || 0) + 1, c), []);
+  const counts = vals.reduce((c, v) => (v !== null && (c[v] = (c[v] || 0) + 1), c), []);
   const rows = features.filter(f => profile.keys.includes(f.key));
   const dim = c => highlight !== null && highlight !== c ? ' class="dim"' : '';
   el.innerHTML = `<h3>Cluster profiles · centre percentile</h3><table><tr><th></th>` +
@@ -153,11 +161,13 @@ async function fetchValues(level, mode) {
   const weights = Object.fromEntries(Object.entries(state).filter(([, s]) => s.on).map(([k, s]) => [k, s.w]));
   const n_clusters = +document.getElementById('k').value;
   const r = await fetch(mode === 'cluster' ? '/cluster' : '/score', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weights, level, n_clusters }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+      weights, level, n_clusters, exclusions: Object.fromEntries(Object.entries(excl).filter(([, x]) => x.on).map(([k, x]) => [k, x.t])),
+    }),
   });
   return r.json();
 }
-function apply(m, j) { vals = m === 'cluster' ? j.labels : j.pct; profile = m === 'cluster' ? j : null; version++; }
+function apply(m, j) { vals = m === 'cluster' ? j.labels : j.pct; profile = m === 'cluster' ? j : null; excludedCount = j.excluded; version++; }
 async function update() {
   if (inflight) { queued = true; return; }
   inflight = true;
@@ -169,6 +179,19 @@ async function update() {
 
 function buildSidebar() {
   const el = document.getElementById('features'); el.innerHTML = '';
+  el.insertAdjacentHTML('beforeend', `<h2>Hard exclusions<span class="count" id="excl-count"></span></h2>`);
+  // Each layer: switch + slider for the coverage share at or above which a zone is excluded.
+  exclusions.forEach(x => {
+    const e = excl[x.key], row = document.createElement('div');
+    row.className = 'f' + (e.on ? '' : ' off');
+    row.innerHTML = `<div class="top"><input type="checkbox" class="sw" id="x-${x.key}" ${e.on ? 'checked' : ''}>
+      <label for="x-${x.key}">${x.label}</label><span class="w" title="Exclude if covered ≥">≥ ${Math.round(e.t * 100)}%</span></div>
+      <input type="range" min="0.05" max="1" step="0.05" value="${e.t}">`;
+    const [tog, tEl, slider] = [row.querySelector('.sw'), row.querySelector('.w'), row.querySelector('input[type=range]')];
+    tog.onchange = () => { e.on = tog.checked; row.classList.toggle('off', !e.on); update(); };
+    slider.oninput = () => { e.t = +slider.value; tEl.textContent = `≥ ${Math.round(e.t * 100)}%`; update(); };
+    el.appendChild(row);
+  });
   let g;
   features.forEach(f => {
     if (f.group !== g) { g = f.group; el.insertAdjacentHTML('beforeend', `<h2>${g}</h2>`); }
@@ -186,6 +209,7 @@ function buildSidebar() {
 
 function setDefaults(clear) {
   features.forEach(f => state[f.key] = { on: !clear && f.default != null, w: clear ? 0.5 : (f.default ?? 0.5) });
+  exclusions.forEach(x => excl[x.key] = { on: !clear, t: 1 });
   buildSidebar(); update();
 }
 
@@ -205,7 +229,7 @@ document.getElementById('basemap').onclick = e => {
 const flatten = zones => zones.flatMap((z, i) => z.polys.map(poly => ({ id: z.id, poly, i })));
 async function setLevel(l) {
   const [m, j] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchValues(l, mode)]);
-  level = l; raw = m.raw; cells = flatten(m.cells); apply(mode, j);
+  level = l; raw = m.raw; cov = m.cov; cells = flatten(m.cells); apply(mode, j);
   document.querySelectorAll('#res button').forEach(b => b.classList.toggle('on', b.dataset.level === l));
   render();
 }
@@ -224,16 +248,17 @@ document.getElementById('k').oninput = e => { document.getElementById('kval').te
 document.getElementById('desc').textContent = DESC.score;
 
 fetch('/meta').then(r => r.json()).then(m => {
-  baseLevel = level = m.levels[0];
-  m.levels.forEach(l => {
-    const b = document.createElement('button'); b.dataset.level = l; b.textContent = l === 'boroughs' ? 'Boroughs' : `H3 ${l}`;
-    b.className = l === level ? 'on' : ''; b.onclick = () => setLevel(l);
+  baseLevel = level = m.levels[0].key;
+  exclusions = m.exclusions;
+  m.levels.forEach(({ key, label }) => {
+    const b = document.createElement('button'); b.dataset.level = key; b.textContent = label;
+    b.className = key === level ? 'on' : ''; b.onclick = () => setLevel(key);
     document.getElementById('res').appendChild(b);
   });
-  const groups = ['Core', 'Amenities (POI count)', 'Nearby landmarks (500m)', 'Streets & cycling'];
+  const groups = ['Core', 'Policy', 'Amenities (POI count)'];
   features = m.features.map((f, col) => ({ ...f, col })).sort((a, b) => groups.indexOf(a.group) - groups.indexOf(b.group) || a.col - b.col);
-  raw = m.raw; cells = flatten(m.cells);
-  vals = cells.map(() => 0.5);
+  raw = m.raw; cov = m.cov; cells = flatten(m.cells);
+  vals = m.raw.map(() => 0.5);
   setDefaults(false);
 });
 </script>

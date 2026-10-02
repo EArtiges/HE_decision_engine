@@ -2,11 +2,9 @@
 
 Run: uv run app.py  ->  http://localhost:8000
 """
-import re
 from pathlib import Path
 
 import geopandas as gpd
-import h3
 import numpy as np
 import pandas as pd
 import shapely
@@ -17,87 +15,58 @@ from pydantic import BaseModel
 from sklearn.cluster import KMeans
 
 HERE = Path(__file__).parent
-gdf = gpd.read_parquet(HERE / "london_physical_features.geoparquet")
+DATA = HERE / "data" / "levels"  # built by prepare_data.py
 
-FEATURES = [c for c in gdf.columns if c not in ("h3_id", "lat", "lon", "geometry")]
-
-# Fill gaps: no POI within 500m -> distance capped at 500m; other gaps -> 0 / median.
-raw = gdf[FEATURES].copy()
-for c in FEATURES:
-    if c.endswith("_min_distance_m"):
-        raw[c] = raw[c].fillna(500.0)
-    elif c == "cbd_distance_m":
-        raw[c] = raw[c].fillna(raw[c].median())
-    else:
-        raw[c] = raw[c].fillna(0.0)
-
-IDX = {c: i for i, c in enumerate(FEATURES)}
-
-# Aggregation to coarser zones (parent H3 cells or boroughs): totals are summed, everything else (densities,
-# 500m-buffer metrics, distances) is averaged, and ratios are recomputed from sums.
-SUMMED = {"population", "station_count", "protected_m", "lane_m", "shared_m", "cycle_m", "street_m", "junction_count"}
-AGG = {c: "sum" if c in SUMMED or c.startswith("poi_") else "mean" for c in FEATURES}
-BASE_RES = h3.get_resolution(gdf.h3_id.iloc[0])
-RESOLUTIONS = [BASE_RES, BASE_RES - 1, BASE_RES - 2]
+LEVEL_LABELS = {"h3_8": "H3 8", "h3_7": "H3 7", "msoa": "MSOA", "boroughs": "Boroughs"}
+BASE_LEVEL = "h3_8"
+EXCLUSIONS = {"flood": "Flood zones 2 & 3", "habitats": "Protected habitats", "monuments": "Scheduled monuments",
+              "brownfield": "Brownfield land"}
 
 
 def ring(coords):
     return [[round(x, 5), round(y, 5)] for x, y in coords]
 
 
-def build_level(zone_ids, shapes):
-    """zone_ids: zone per base cell (NaN = excluded); shapes: zone -> list of rings."""
-    df = raw.groupby(zone_ids.values).agg(AGG)
-    df["cycle_street_ratio"] = (df.cycle_m / df.street_m).replace([np.inf], np.nan).fillna(0.0)
-    df["protected_share"] = (df.protected_m / df.cycle_m).fillna(0.0)
-    return {
-        "cells": [{"id": z, "polys": shapes(z)} for z in df.index],
-        "raw": df.round(1).to_numpy().tolist(),
+def load_level(key):
+    g = gpd.read_parquet(DATA / f"{key}.parquet")
+    feats = [c for c in g.columns if c not in ("zone_id", "geometry") and not c.startswith("cov_")]
+    return feats, {
+        # A zone can have several polygons (e.g. boroughs split by the Thames).
+        "cells": [{"id": z, "polys": [ring(p.exterior.coords) for p in shapely.get_parts(geom)]}
+                  for z, geom in zip(g.zone_id, g.geometry)],
+        "raw": g[feats].round(1).to_numpy().tolist(),
         # Percentile-rank each feature to [0, 1] so weights are comparable despite skew/units.
-        "norm": df.rank(pct=True).to_numpy(dtype=np.float64),
+        "norm": g[feats].rank(pct=True).to_numpy(dtype=np.float64),
+        "cov": {c[4:]: g[c].to_numpy() for c in g.columns if c.startswith("cov_")},
     }
 
 
-LEVELS = {
-    str(r): build_level(
-        gdf.h3_id.map(lambda h: h3.cell_to_parent(h, r)),
-        lambda z: [ring((lng, lat) for lat, lng in h3.cell_to_boundary(z))],
-    )
-    for r in RESOLUTIONS
-}
+LEVELS = {}
+for key in LEVEL_LABELS:
+    FEATURES, LEVELS[key] = load_level(key)
+IDX = {c: i for i, c in enumerate(FEATURES)}
 
-# Boroughs (ONS LAD Dec 2023, generalised): each H3 cell goes to the borough containing its centre;
-# cells centred outside Greater London are dropped.
-boroughs = gpd.read_file(HERE / "london_boroughs.geojson").set_index("LAD23NM")
-centres = gpd.GeoDataFrame(geometry=gpd.points_from_xy(gdf.lon, gdf.lat), crs=4326)
-borough_of = gpd.sjoin(centres, boroughs[["geometry"]], how="left", predicate="within")["LAD23NM"]
-borough_of = borough_of[~borough_of.index.duplicated()]
-LEVELS["boroughs"] = build_level(
-    borough_of,
-    lambda z: [ring(p.exterior.coords) for p in shapely.get_parts(boroughs.geometry[z].simplify(0.0003))],
-)
+# How base cells were combined into larger zones (area-weighted, see prepare_data.py).
+SUMMED = {"population", "station_count", "brownfield_ha"}
+AGG = {c: "sum" if c in SUMMED or c.startswith("poi_") else "mean" for c in FEATURES}
+LABELS = {"cbd_distance_m": "CBD distance (m)", "green_belt_pct": "Green Belt coverage (%)",
+          "brownfield_ha": "Brownfield land (ha)"}
 
 
 def group(c):
     if c.startswith("poi_"):
         return "Amenities (POI count)"
-    if c.endswith("_500m") or c.endswith("_min_distance_m"):
-        return "Nearby landmarks (500m)"
-    if c in ("population", "station_count", "cbd_distance_m"):
-        return "Core"
-    return "Streets & cycling"
+    if c in ("green_belt_pct", "brownfield_ha"):
+        return "Policy"
+    return "Core"
 
 
 def label(c):
-    s = re.sub(r"^poi_", "", c)
-    s = re.sub(r"_500m$", "", s)
-    s = s.replace("_km_km2", " (km/km²)").replace("_km2", " (/km²)")
-    s = re.sub(r"_m$", " (m)", s)
-    s = s.replace("cbd", "CBD").replace("_", " ")
+    s = LABELS.get(c) or c.removeprefix("poi_").replace("_", " ")
     return s[0].upper() + s[1:]
 
 
-DEFAULTS = {"population": 0.6, "transit_importance_500m": 0.5, "greenspace_count_500m": 0.3, "cbd_distance_m": -0.4}
+DEFAULTS = {"population": 0.6, "cbd_distance_m": -0.4, "brownfield_ha": 0.5, "poi_health_care": 0.3}
 
 app = FastAPI()
 
@@ -108,37 +77,53 @@ def index():
 
 
 @app.get("/meta")
-def meta(level: str = str(BASE_RES)):
+def meta(level: str = BASE_LEVEL):
+    L = LEVELS[level]
     return {
-        "levels": list(LEVELS),
+        "levels": [{"key": k, "label": v} for k, v in LEVEL_LABELS.items()],
+        "exclusions": [{"key": k, "label": v} for k, v in EXCLUSIONS.items()],
         "features": [{"key": c, "label": label(c), "group": group(c), "default": DEFAULTS.get(c), "agg": AGG[c]} for c in FEATURES],
-        "cells": LEVELS[level]["cells"],
-        "raw": LEVELS[level]["raw"],
+        "cells": L["cells"],
+        "raw": L["raw"],
+        "cov": {g: np.round(L["cov"][g], 3).tolist() for g in EXCLUSIONS},  # for the tooltip
     }
 
 
 class Weights(BaseModel):
     weights: dict[str, float]
-    level: str = str(BASE_RES)
+    level: str = BASE_LEVEL
+    exclusions: dict[str, float] = {}  # enabled exclusion layer -> coverage threshold
 
 
-def weight_vector(weights):
-    w = np.zeros(len(FEATURES))
-    for k, v in weights.items():
-        if k in IDX:
-            w[IDX[k]] = v
-    return w
+def excluded_mask(body):
+    """Zones where any enabled exclusion layer covers at least its own threshold."""
+    L = LEVELS[body.level]
+    mask = np.zeros(len(L["norm"]), dtype=bool)
+    for g, t in body.exclusions.items():
+        if g in EXCLUSIONS:
+            mask |= L["cov"][g] >= t - 1e-6  # tolerance so fully covered zones count at 100%
+    return mask
+
+
+def with_gaps(values, mask):
+    """Full-length list with None for excluded zones."""
+    out = [None] * len(mask)
+    for i, v in zip(np.flatnonzero(~mask), values):
+        out[i] = v
+    return out
 
 
 @app.post("/score")
 def score(body: Weights):
-    w = weight_vector(body.weights)
-    norm = LEVELS[body.level]["norm"]
-    if not w.any():
-        return {"pct": [0.5] * len(norm)}
-    s = norm @ w
-    pct = pd.Series(s).rank(pct=True).to_numpy()
-    return {"pct": np.round(pct, 4).tolist()}
+    w = np.zeros(len(FEATURES))
+    for k, v in body.weights.items():
+        if k in IDX:
+            w[IDX[k]] = v
+    mask = excluded_mask(body)
+    norm = LEVELS[body.level]["norm"][~mask]
+    # Percentiles are ranked among the zones that survive the exclusions.
+    pct = pd.Series(norm @ w).rank(pct=True).to_numpy() if w.any() else np.full(len(norm), 0.5)
+    return {"pct": with_gaps(np.round(pct, 4).tolist(), mask), "excluded": int(mask.sum())}
 
 
 class ClusterRequest(Weights):
@@ -147,19 +132,22 @@ class ClusterRequest(Weights):
 
 @app.post("/cluster")
 def cluster(body: ClusterRequest):
-    # Vector per zone = percentiles of the features switched on (weights are ignored).
+    # Vector per surviving zone = percentiles of the features switched on (weights are ignored).
     keys = [k for k in body.weights if k in IDX]
-    X = LEVELS[body.level]["norm"][:, [IDX[k] for k in keys]]
+    mask = excluded_mask(body)
+    X = LEVELS[body.level]["norm"][~mask][:, [IDX[k] for k in keys]]
     k = max(1, min(body.n_clusters, len(X)))
-    if not keys or k == 1:
-        return {"labels": [0] * len(X), "keys": keys, "centers": [np.round(X.mean(0) * 100, 1).tolist()]}
+    if not keys or k == 1 or len(X) == 0:
+        centers = [np.round(X.mean(0) * 100, 1).tolist()] if len(X) else []
+        return {"labels": with_gaps([0] * len(X), mask), "keys": keys, "centers": centers, "excluded": int(mask.sum())}
     km = KMeans(n_clusters=k).fit(X)
     # K-means label ids are arbitrary; renumber by cluster size so colours stay stable between runs.
     order = np.argsort(-np.bincount(km.labels_, minlength=k))
     return {
-        "labels": np.argsort(order)[km.labels_].tolist(),
+        "labels": with_gaps(np.argsort(order)[km.labels_].tolist(), mask),
         "keys": keys,
         "centers": np.round(km.cluster_centers_[order] * 100, 1).tolist(),  # [cluster][feature], percentile 0-100
+        "excluded": int(mask.sum()),
     }
 
 
