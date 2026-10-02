@@ -8,6 +8,7 @@
 <link href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/deck.gl@9.1.14/dist.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
 <style>
   :root { --bg: #111418; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --muted: #8a93a3; --accent: #4fb477; }
   * { box-sizing: border-box; }
@@ -21,6 +22,7 @@
   .legend .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #d73027, #ffffff, #1a9850); }
   .legend .ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
   .actions { display: flex; gap: 8px; margin-top: 14px; }
+  .actions.config { margin-top: 12px; }
   button { flex: 1; background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px; font: inherit; cursor: pointer; }
   button:hover { border-color: var(--muted); }
   .seg { display: flex; margin-top: 14px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
@@ -33,15 +35,20 @@
   .swatches { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .swatches i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
   [hidden] { display: none !important; }
-  #profile { position: absolute; right: 12px; bottom: 36px; z-index: 1; max-height: calc(100% - 60px); overflow: auto;
+  #profile, #deciles { position: absolute; right: 12px; bottom: 36px; z-index: 1; max-height: calc(100% - 60px); overflow: auto;
     background: #171b21ee; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 11px; }
-  #profile h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  #profile h3, #deciles h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
   #profile table { border-collapse: separate; border-spacing: 2px; }
   #profile th { font-weight: 500; color: var(--muted); padding: 0 4px 4px; cursor: default; white-space: nowrap; }
   #profile th i { display: block; height: 4px; border-radius: 2px; margin-bottom: 4px; }
   #profile td { padding: 3px 6px; text-align: center; font-variant-numeric: tabular-nums; border-radius: 3px; min-width: 32px; transition: opacity .15s; }
   #profile td:first-child { text-align: left; color: var(--text); background: none; padding-left: 0; white-space: nowrap; }
-  #profile .dim { opacity: 0.25; }
+  #profile .dim, #deciles .dim { opacity: 0.25; }
+  #deciles .dec { display: flex; align-items: center; gap: 8px; padding: 2px 4px; border-radius: 3px; cursor: default; transition: opacity .15s; }
+  #deciles .dec:hover { background: #ffffff10; }
+  #deciles .dec i { width: 22px; height: 12px; border-radius: 2px; }
+  #deciles .dec span { flex: 1; color: var(--text); white-space: nowrap; }
+  #deciles .dec b { font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 32px; text-align: right; }
   #features { flex: 1; overflow-y: auto; padding: 4px 0 20px; }
   h2 { margin: 18px 20px 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
   h2 .count { float: right; text-transform: none; letter-spacing: 0; font-weight: 400; }
@@ -69,16 +76,17 @@
   <header>
     <h1>Homes England investment decision engine</h1>
     <p id="desc"></p>
-    <div class="legend" id="legend-score"><div class="bar"></div><div class="ticks"><span>0th</span><span>50th</span><span>100th</span></div></div>
     <div class="legend swatches" id="legend-cluster" hidden></div>
     <div class="actions"><button id="reset">Reset</button><button id="clear">Clear all</button><button id="basemap">Light map</button></div>
     <div class="seg" id="res"><span>Zones</span></div>
     <div class="seg" id="mode"><button data-mode="score" class="on">Scores</button><button data-mode="cluster">Cluster areas</button></div>
     <div class="kctl" id="kctl" hidden><span>Clusters</span><input type="range" id="k" min="1" max="10" value="5"><b id="kval">5</b></div>
+    <div class="actions config"><button id="export">Export config</button><button id="load">Load config</button></div>
+    <input type="file" id="load-file" accept=".yaml,.yml" hidden>
   </header>
   <div id="features"></div>
 </aside>
-<div id="map"><div id="profile" hidden></div></div>
+<div id="map"><div id="profile" hidden></div><div id="deciles"></div></div>
 
 <script>
 const state = {};          // key -> {on, w}
@@ -96,7 +104,13 @@ const scoreColor = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p 
 const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
   .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
 const EXCLUDED = [110, 116, 128, 70];
-const color = v => v === null ? EXCLUDED : mode === 'cluster' ? [...TAB10[v % 10], highlight === null || highlight === v ? 255 : 25] : scoreColor(v);
+const decile = p => Math.min(9, Math.floor(p * 10));
+// highlight = hovered cluster (cluster mode) or decile (score mode); everything else fades.
+const color = v => {
+  if (v === null) return highlight === null ? EXCLUDED : [...EXCLUDED.slice(0, 3), 15];
+  const group = mode === 'cluster' ? v : decile(v);
+  return [...(mode === 'cluster' ? TAB10[v % 10] : scoreColor(v)), highlight === null || highlight === group ? 255 : 25];
+};
 
 const map = new deck.DeckGL({
   container: 'map',
@@ -130,6 +144,7 @@ function render() {
       `<span><i style="background:rgb(${TAB10[c % 10]})"></i>${c + 1} · ${n}</span>`).join('');
   }
   renderProfile();
+  renderDeciles();
   const n = document.getElementById('excl-count');
   if (n) n.textContent = `${excludedCount.toLocaleString()} of ${vals.length.toLocaleString()} excluded`;
 }
@@ -149,10 +164,25 @@ function renderProfile() {
       return `<td data-c="${c}"${dim(c)} style="background:rgb(${scoreColor(v / 100)});color:${Math.abs(v - 50) > 30 ? '#fff' : '#111'}">${Math.round(v)}</td>`;
     }).join('') + '</tr>'; }).join('') + '</table>';
 }
-// Hovering a cluster column fades the other clusters on the map.
-const profileEl = document.getElementById('profile');
-profileEl.addEventListener('mouseover', e => { const c = e.target.closest('[data-c]'); setHighlight(c ? +c.dataset.c : null); });
-profileEl.addEventListener('mouseleave', () => setHighlight(null));
+// Decile scale (score mode): one row per decile, top = best, with the number of zones in each.
+function renderDeciles() {
+  const el = document.getElementById('deciles');
+  el.hidden = mode !== 'score';
+  if (el.hidden) return;
+  const counts = Array(10).fill(0);
+  vals.forEach(v => v !== null && counts[decile(v)]++);
+  const dim = d => highlight !== null && highlight !== d ? ' dim' : '';
+  el.innerHTML = '<h3>Score percentile</h3>' + [9, 8, 7, 6, 5, 4, 3, 2, 1, 0].map(d =>
+    `<div class="dec${dim(d)}" data-c="${d}"><i style="background:rgb(${scoreColor((d + 0.5) / 10)})"></i>` +
+    `<span>${d * 10}th–${d === 9 ? 100 : d * 10 + 9}th</span><b>${counts[d].toLocaleString()}</b></div>`).join('');
+}
+
+// Hovering a cluster column or a decile row fades the other zones on the map.
+['profile', 'deciles'].forEach(id => {
+  const el = document.getElementById(id);
+  el.addEventListener('mouseover', e => { const c = e.target.closest('[data-c]'); setHighlight(c ? +c.dataset.c : null); });
+  el.addEventListener('mouseleave', () => setHighlight(null));
+});
 function setHighlight(c) { if (c !== highlight) { highlight = c; render(); } }
 
 // Latest-wins request coalescing: never more than one request in flight.
@@ -216,6 +246,51 @@ function setDefaults(clear) {
 document.getElementById('reset').onclick = () => setDefaults(false);
 document.getElementById('clear').onclick = () => setDefaults(true);
 
+// Export every sidebar parameter as a YAML file (labels are double-quoted, which is valid YAML).
+document.getElementById('export').onclick = () => {
+  const q = JSON.stringify;
+  const lines = [
+    `# Homes England investment decision engine: config exported ${new Date().toISOString()}`,
+    `zones: ${level}`,
+    `mode: ${mode}`,
+    `n_clusters: ${document.getElementById('k').value}`,
+    'hard_exclusions:  # zone excluded if layer coverage >= threshold',
+    ...exclusions.flatMap(x => [`  ${x.key}:`, `    label: ${q(x.label)}`, `    enabled: ${excl[x.key].on}`, `    threshold: ${excl[x.key].t}`]),
+    'features:  # weights in [-1, 1]',
+    ...features.flatMap(f => [`  ${f.key}:`, `    label: ${q(f.label)}`, `    enabled: ${state[f.key].on}`, `    weight: ${state[f.key].w}`]),
+  ];
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lines.join('\n') + '\n'], { type: 'application/yaml' }));
+  a.download = `decision-engine-config-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '')}.yaml`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+// Load a config exported above: anything the file doesn't mention is switched off.
+const clamp = (v, lo, hi, dflt) => Number.isFinite(+v) ? Math.min(hi, Math.max(lo, +v)) : dflt;
+document.getElementById('load').onclick = () => document.getElementById('load-file').click();
+document.getElementById('load-file').onchange = async e => {
+  const file = e.target.files[0];
+  e.target.value = '';   // allow re-loading the same file
+  if (!file) return;
+  let cfg;
+  try { cfg = jsyaml.load(await file.text()) || {}; } catch (err) { alert(`Could not read ${file.name}:\n${err.message}`); return; }
+  features.forEach(f => {
+    const c = cfg.features?.[f.key];
+    state[f.key] = { on: !!c?.enabled, w: clamp(c?.weight, -1, 1, 0.5) };
+  });
+  exclusions.forEach(x => {
+    const c = cfg.hard_exclusions?.[x.key];
+    excl[x.key] = { on: !!c?.enabled, t: clamp(c?.threshold, 0.05, 1, 1) };
+  });
+  const k = clamp(cfg.n_clusters, 1, 10, 5);
+  document.getElementById('k').value = k; document.getElementById('kval').textContent = k;
+  buildSidebar();
+  if (cfg.zones && cfg.zones !== level && document.querySelector(`#res button[data-level="${cfg.zones}"]`)) await setLevel(cfg.zones);
+  if ((cfg.mode === 'score' || cfg.mode === 'cluster') && cfg.mode !== mode) await setMode(cfg.mode);
+  update();
+};
+
 const BASEMAPS = { dark: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json', light: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json' };
 let basemap = 'dark';
 document.getElementById('basemap').onclick = e => {
@@ -238,7 +313,6 @@ async function setMode(m) {
   const j = await fetchValues(level, m);
   mode = m; highlight = null; apply(m, j);
   document.querySelectorAll('#mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
-  document.getElementById('legend-score').hidden = m !== 'score';
   document.getElementById('legend-cluster').hidden = document.getElementById('kctl').hidden = m !== 'cluster';
   document.getElementById('desc').textContent = DESC[m];
   render();
