@@ -35,6 +35,22 @@
   .swatches { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .swatches i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
   [hidden] { display: none !important; }
+  #chat-open { position: absolute; top: 12px; right: 12px; z-index: 2; width: auto; padding: 8px 14px; background: var(--panel); }
+  #chat { position: absolute; top: 12px; right: 12px; z-index: 2; width: 380px; max-height: 58%; display: flex; flex-direction: column;
+    background: #171b21f2; border: 1px solid var(--line); border-radius: 8px; }
+  #chat .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  #chat .head b { flex: 1; font-weight: 600; }
+  #chat .head button { flex: none; width: auto; padding: 3px 8px; font-size: 12px; }
+  #chat-log { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; min-height: 60px; }
+  #chat-log .msg { white-space: pre-wrap; line-height: 1.45; }
+  #chat-log .user { align-self: flex-end; background: #262c35; padding: 6px 10px; border-radius: 8px; max-width: 85%; }
+  #chat-log .step { color: var(--muted); font-size: 12px; }
+  #chat-log .err { color: #ef8a80; font-size: 12px; }
+  #chat form { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line); }
+  #chat textarea { flex: 1; resize: none; height: 54px; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; font: inherit; }
+  #chat form button { flex: none; width: auto; padding: 0 14px; }
+  #chat form button:disabled { opacity: 0.5; cursor: default; }
   #profile, #deciles { position: absolute; right: 12px; bottom: 36px; z-index: 1; max-height: calc(100% - 60px); overflow: auto;
     background: #171b21ee; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 11px; }
   #profile h3, #deciles h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
@@ -86,7 +102,14 @@
   </header>
   <div id="features"></div>
 </aside>
-<div id="map"><div id="profile" hidden></div><div id="deciles"></div></div>
+<div id="map"><div id="profile" hidden></div><div id="deciles"></div>
+  <button id="chat-open">Ask the agent</button>
+  <div id="chat" hidden>
+    <div class="head"><b>Agent</b><button id="chat-new" title="Start a new conversation">New chat</button><button id="chat-close">✕</button></div>
+    <div id="chat-log"><div class="msg step">Describe what you want to see, e.g. "family homes near schools and green space, away from flood risk". The agent investigates the data, picks parameters and loads them into the map.</div></div>
+    <form id="chat-form"><textarea id="chat-input" placeholder="What do you want to see?"></textarea><button>Send</button></form>
+  </div>
+</div>
 
 <script>
 const state = {};          // key -> {on, w}
@@ -246,10 +269,10 @@ function setDefaults(clear) {
 document.getElementById('reset').onclick = () => setDefaults(false);
 document.getElementById('clear').onclick = () => setDefaults(true);
 
-// Export every sidebar parameter as a YAML file (labels are double-quoted, which is valid YAML).
-document.getElementById('export').onclick = () => {
+// Every sidebar parameter as YAML (labels are double-quoted, which is valid YAML).
+function configYaml() {
   const q = JSON.stringify;
-  const lines = [
+  return [
     `# Homes England investment decision engine: config exported ${new Date().toISOString()}`,
     `zones: ${level}`,
     `mode: ${mode}`,
@@ -258,9 +281,11 @@ document.getElementById('export').onclick = () => {
     ...exclusions.flatMap(x => [`  ${x.key}:`, `    label: ${q(x.label)}`, `    enabled: ${excl[x.key].on}`, `    threshold: ${excl[x.key].t}`]),
     'features:  # weights in [-1, 1]',
     ...features.flatMap(f => [`  ${f.key}:`, `    label: ${q(f.label)}`, `    enabled: ${state[f.key].on}`, `    weight: ${state[f.key].w}`]),
-  ];
+  ].join('\n') + '\n';
+}
+document.getElementById('export').onclick = () => {
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([lines.join('\n') + '\n'], { type: 'application/yaml' }));
+  a.href = URL.createObjectURL(new Blob([configYaml()], { type: 'application/yaml' }));
   a.download = `decision-engine-config-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '')}.yaml`;
   a.click();
   URL.revokeObjectURL(a.href);
@@ -275,6 +300,9 @@ document.getElementById('load-file').onchange = async e => {
   if (!file) return;
   let cfg;
   try { cfg = jsyaml.load(await file.text()) || {}; } catch (err) { alert(`Could not read ${file.name}:\n${err.message}`); return; }
+  applyConfig(cfg);
+};
+async function applyConfig(cfg) {
   features.forEach(f => {
     const c = cfg.features?.[f.key];
     state[f.key] = { on: !!c?.enabled, w: clamp(c?.weight, -1, 1, 0.5) };
@@ -289,6 +317,53 @@ document.getElementById('load-file').onchange = async e => {
   if (cfg.zones && cfg.zones !== level && document.querySelector(`#res button[data-level="${cfg.zones}"]`)) await setLevel(cfg.zones);
   if ((cfg.mode === 'score' || cfg.mode === 'cluster') && cfg.mode !== mode) await setMode(cfg.mode);
   update();
+}
+
+// Chat with the agent (agent.py): it investigates the data, then pushes a config that is loaded via applyConfig().
+let chatSession = null;
+const chatLog = document.getElementById('chat-log');
+const STEPS = { describe_data: 'Looking at the data…', preview_config: 'Testing a configuration…', apply_config: 'Loading it into the map…' };
+function chatLine(cls, text) {
+  const el = document.createElement('div');
+  el.className = `msg ${cls}`; el.textContent = text;
+  if (!cls) el.innerHTML = el.innerHTML.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');   // agent text: render **bold** (escaped first)
+  chatLog.appendChild(el); chatLog.scrollTop = chatLog.scrollHeight;
+  return el;
+}
+document.getElementById('chat-open').onclick = () => { document.getElementById('chat').hidden = false; document.getElementById('chat-open').hidden = true; document.getElementById('chat-input').focus(); };
+document.getElementById('chat-close').onclick = () => { document.getElementById('chat').hidden = true; document.getElementById('chat-open').hidden = false; };
+document.getElementById('chat-new').onclick = () => { chatSession = null; chatLog.innerHTML = ''; chatLine('step', 'New conversation.'); };
+document.getElementById('chat-input').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('chat-form').requestSubmit(); } };
+document.getElementById('chat-form').onsubmit = async e => {
+  e.preventDefault();
+  const input = document.getElementById('chat-input'), send = e.target.querySelector('button');
+  const message = input.value.trim();
+  if (!message || send.disabled) return;
+  input.value = ''; send.disabled = true;
+  chatLine('user', message);
+  const thinking = chatLine('step', 'Thinking…');
+  try {
+    const res = await fetch('/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, config_yaml: configYaml(), session_id: chatSession }) });
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines.filter(Boolean)) {
+        const ev = JSON.parse(line);
+        thinking.remove();
+        if (ev.type === 'text') chatLine('', ev.text);
+        else if (ev.type === 'tool') chatLine('step', STEPS[ev.name] || ev.name);
+        else if (ev.type === 'config') { await applyConfig(ev.config); chatLine('step', `Loaded configs/${ev.file}`); }
+        else if (ev.type === 'done') { chatSession = ev.session_id; if (ev.error) chatLine('err', 'The agent stopped with an error.'); }
+        else if (ev.type === 'error') chatLine('err', ev.text);
+      }
+    }
+  } catch (err) { thinking.remove(); chatLine('err', String(err)); }
+  send.disabled = false; input.focus();
 };
 
 const BASEMAPS = { dark: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json', light: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json' };

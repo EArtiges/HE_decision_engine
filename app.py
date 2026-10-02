@@ -2,6 +2,7 @@
 
 Run: uv run app.py  ->  http://localhost:8000
 """
+import json
 from pathlib import Path
 
 import geopandas as gpd
@@ -10,9 +11,11 @@ import pandas as pd
 import shapely
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sklearn.cluster import KMeans
+
+import agent
 
 HERE = Path(__file__).parent
 DATA = HERE / "data" / "levels"  # built by prepare_data.py
@@ -149,6 +152,107 @@ def cluster(body: ClusterRequest):
         "centers": np.round(km.cluster_centers_[order] * 100, 1).tolist(),  # [cluster][feature], percentile 0-100
         "excluded": int(mask.sum()),
     }
+
+
+# --- Chat agent (agent.py): tools to investigate the data and evaluate configs --------------
+
+DESCRIPTIONS = {
+    "population": "Resident population",
+    "station_count": "Number of rail / Underground / Overground stations",
+    "cbd_distance_m": "Distance to central London in metres (higher = further out)",
+    "green_belt_pct": "Share of the zone designated Green Belt, in %",
+    "brownfield_ha": "Brownfield land register sites, in hectares",
+}
+EXCLUSION_DESCRIPTIONS = {
+    "flood": "Environment Agency Flood Zones 2 & 3 (river and sea flood risk)",
+    "habitats": "SSSI, SAC, SPA and ancient woodland",
+    "monuments": "Historic England scheduled monuments",
+    "brownfield": "Brownfield land register sites (coverage estimated from site hectares / zone area)",
+}
+
+
+def describe(level):
+    if level not in LEVELS:
+        raise ValueError(f"Unknown zones {level!r}; use one of {list(LEVELS)}")
+    L = LEVELS[level]
+    raw = np.asarray(L["raw"], dtype=float)
+    features = []
+    for c in FEATURES:
+        col = raw[:, IDX[c]]
+        q = np.percentile(col, [0, 25, 50, 75, 100]).round(1).tolist()
+        features.append({"key": c, "label": label(c), "group": group(c), "aggregation": AGG[c],
+                         "description": DESCRIPTIONS.get(c) or f"Count of {label(c).lower()} points of interest (Overture)",
+                         "min_p25_median_p75_max": q, "share_of_zones_zero": round(float((col == 0).mean()), 2)})
+    corr = np.corrcoef(L["norm"].T)  # Spearman, since norm holds ranks
+    pairs = sorted(((abs(corr[i, j]), FEATURES[i], FEATURES[j], round(float(corr[i, j]), 2))
+                    for i in range(len(FEATURES)) for j in range(i + 1, len(FEATURES))), reverse=True)[:12]
+    return {
+        "zone_levels": {k: {"label": v, "zones": len(LEVELS[k]["norm"])} for k, v in LEVEL_LABELS.items()},
+        "described_level": level,
+        "features": features,
+        "most_correlated_feature_pairs": [{"a": a, "b": b, "spearman": r} for _, a, b, r in pairs],
+        "hard_exclusions": [{"key": g, "label": EXCLUSIONS[g], "description": EXCLUSION_DESCRIPTIONS[g],
+                             "zones_covered_at_least_50pct": int((L["cov"][g] >= 0.5).sum()),
+                             "zones_fully_covered": int((L["cov"][g] >= 1 - 1e-6).sum())} for g in EXCLUSIONS],
+    }
+
+
+def parse_config(cfg):
+    """Config dict (export format) -> (request, mode). Raises ValueError on invalid content."""
+    level = cfg.get("zones", BASE_LEVEL)
+    if level not in LEVELS:
+        raise ValueError(f"Unknown zones {level!r}; use one of {list(LEVELS)}")
+    mode = cfg.get("mode", "score")
+    if mode not in ("score", "cluster"):
+        raise ValueError("mode must be 'score' or 'cluster'")
+    feats, excl = cfg.get("features") or {}, cfg.get("hard_exclusions") or {}
+    unknown = [k for k in feats if k not in IDX] + [k for k in excl if k not in EXCLUSIONS]
+    if unknown:
+        raise ValueError(f"Unknown keys: {unknown}")
+    req = ClusterRequest(
+        level=level,
+        n_clusters=int(np.clip(cfg.get("n_clusters", 5), 1, 10)),
+        weights={k: float(np.clip(v.get("weight", 0.5), -1, 1)) for k, v in feats.items() if v and v.get("enabled")},
+        exclusions={k: float(np.clip(v.get("threshold", 1), 0.05, 1)) for k, v in excl.items() if v and v.get("enabled")},
+    )
+    return req, mode
+
+
+def evaluate(cfg):
+    """Summary of what a config produces, for the agent to check its work."""
+    req, mode = parse_config(cfg)
+    L = LEVELS[req.level]
+    ids = [c["id"] for c in L["cells"]]
+    enabled = list(req.weights)
+    out = {"zones": req.level, "mode": mode, "total_zones": len(ids)}
+    if mode == "cluster":
+        r = cluster(req)
+        labels = [v for v in r["labels"] if v is not None]
+        out |= {"excluded": r["excluded"], "cluster_sizes": np.bincount(labels).tolist() if labels else [],
+                "cluster_centre_percentiles": [dict(zip(r["keys"], c)) for c in r["centers"]]}
+        return out
+    r = score(req)
+    ranked = sorted((p, i) for i, p in enumerate(r["pct"]) if p is not None)
+    row = lambda p, i: {"zone": ids[i], "score_percentile": round(p * 100),
+                        **{f: L["raw"][i][IDX[f]] for f in enabled}}
+    out |= {"excluded": r["excluded"], "top_10": [row(p, i) for p, i in ranked[::-1][:10]],
+            "bottom_5": [row(p, i) for p, i in ranked[:5]]}
+    return out
+
+
+class ChatRequest(BaseModel):
+    message: str
+    config_yaml: str = ""          # the user's current sidebar settings
+    session_id: str | None = None  # continue a previous conversation
+
+
+@app.post("/chat")
+async def chat(body: ChatRequest):
+    """Streams agent events as newline-delimited JSON."""
+    async def events():
+        async for e in agent.chat(body.message, body.config_yaml, body.session_id, describe, evaluate):
+            yield json.dumps(e) + "\n"
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 if __name__ == "__main__":

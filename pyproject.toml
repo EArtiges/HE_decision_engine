@@ -3,10 +3,12 @@ name = "he-decision-engine"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "claude-agent-sdk>=0.2.163",
     "fastapi>=0.141.1",
     "geopandas>=1.1.4",
     "h3>=4.5.0",
     "pyarrow>=25.0.1",
+    "pyyaml>=6.0.3",
     "scikit-learn>=1.9.1",
     "uvicorn>=0.53.0",
 ]

@@ -31,9 +31,16 @@ The tables in `data/levels/` are committed, so you only need to run `prepare_dat
 ## How it works
 
 - **Zones:** H3 resolution 8 and 7, MSOAs and boroughs. Values are spread from the base H3 cells to the larger zones by overlapping area: totals are split by area and the other features are averaged by area. Policy and exclusion coverage are calculated directly from the zone shapes.
-- **Hard exclusions:** a zone is removed if the switched-on constraint layers together cover at least the threshold share of it (50% by default). Removed zones are greyed out and left out of the ranking and clustering.
+- **Hard exclusions:** each layer has its own threshold (100% by default). A zone is removed if any switched-on layer covers at least that layer's threshold share of it. Brownfield coverage is estimated as the zone's brownfield hectares divided by its area. Removed zones are greyed out and left out of the ranking and clustering.
 - **Scoring:** each feature is converted to a percentile. The switched-on features are combined as a weighted sum (weights from −1 to 1), and the result is shown as a percentile among the zones that aren't excluded. Red means low and green means high.
 - **Clustering:** "Cluster areas" runs scikit-learn k-means (default settings, 1–10 clusters) on the feature percentiles of the zones that aren't excluded. The cluster profiles panel shows each cluster's centre.
+- **Agent (`agent.py`):** "Ask the agent" on the map opens a chat window. You describe what you want to see. Claude, running through the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/python) on your local Claude Code login, does the rest:
+  1. investigates the data with in-process tools (`describe_data`, `preview_config`)
+  2. writes a config, which is saved to `configs/`
+  3. loads the config into the map (`apply_config`)
+  4. explains its choices
+
+  The agent has no other tools: no shell, file or web access. Follow-up messages continue the same conversation, and "New chat" starts a fresh one.
 - **Front end (`index.html`):** a single file using deck.gl and MapLibre. No build step.
 
 ## Caveats
