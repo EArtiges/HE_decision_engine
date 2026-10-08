@@ -143,7 +143,7 @@ def cluster(body: ClusterRequest):
     if not keys or k == 1 or len(X) == 0:
         centers = [np.round(X.mean(0) * 100, 1).tolist()] if len(X) else []
         return {"labels": with_gaps([0] * len(X), mask), "keys": keys, "centers": centers, "excluded": int(mask.sum())}
-    km = KMeans(n_clusters=k).fit(X)
+    km = KMeans(n_clusters=k, random_state=0).fit(X)  # fixed seed: same inputs, same clusters
     # K-means label ids are arbitrary; renumber by cluster size so colours stay stable between runs.
     order = np.argsort(-np.bincount(km.labels_, minlength=k))
     return {

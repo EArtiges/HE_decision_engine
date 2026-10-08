@@ -47,5 +47,5 @@ The tables in `data/levels/` are committed, so you only need to run `prepare_dat
 
 - Inner-London MSOAs are often smaller than an H3 cell at resolution 8. Their base features are therefore smoothed across neighbouring MSOAs, but their policy and exclusion values are exact.
 - A missing CBD distance is set to the median, and other missing values are set to 0.
-- K-means has no fixed random seed, so cluster boundaries can shift a little between runs.
+- K-means uses a fixed random seed (`random_state=0`), so the same settings always give the same clusters.
 - Summed features favour larger zones.
