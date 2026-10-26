@@ -1,18 +1,32 @@
-"""Chat agent: Claude (via the Claude Agent SDK and the local Claude Code login) turns a plain-language
-request into a decision-engine config, by investigating the data through a few in-process tools.
+"""Chat agent: a Microsoft Foundry prompt agent turns a plain-language request into a decision-engine config,
+by investigating the data through a few function tools that run here, in the app, and searching the programme
+documents with Foundry file search (vector store kept up to date by refresh/docs_sync.py).
 
-The agent has no built-in tools (no shell, no file access): only the tools defined here.
+The agent is registered in the Foundry project at first use (a new version only when the instructions or tools
+change). Its only Foundry-hosted tool is file search: no web search or code interpreter.
+Auth is Entra ID via DefaultAzureCredential (`az login` locally, managed identity when deployed).
 """
+import hashlib
 import json
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 
 import yaml
-from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, ToolUseBlock,
-                              create_sdk_mcp_server, query, tool)
+from azure.ai.projects.aio import AIProjectClient
+from azure.ai.projects.models import FileSearchTool, FunctionTool, PromptAgentDefinition
+from azure.identity.aio import DefaultAzureCredential
 
 CONFIGS = Path(__file__).parent / "configs"  # every config the agent applies is saved here
-MODEL = "claude-opus-5-5"
+ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT",
+                          "https://ai-applications-uk-resource.services.ai.azure.com/api/projects/ai-applications-uk")
+MODEL = os.environ.get("FOUNDRY_MODEL_DEPLOYMENT", "gpt-6-luna")
+AGENT_NAME = os.environ.get("FOUNDRY_AGENT_NAME", "he-decision-engine")
+# file search citation markers the model writes inline: private-use characters around words like filecite, turn0file1
+CITATION = re.compile("[\ue000-\uf8ff][\\w\ue000-\uf8ff]*")
+VECTOR_STORE = "he-programme-documents"  # created and refreshed by refresh/docs_sync.py
+MAX_TURNS = 25  # model round-trips per user message
 
 SYSTEM_PROMPT = """You are the analyst behind the "Homes England investment decision engine", a map of London \
 that scores zones (H3 hexagons, MSOAs or boroughs) to support housing investment and site-selection discussions.
@@ -22,6 +36,13 @@ How the engine works:
 enabled features (weights in [-1, 1]), then shown as a percentile among non-excluded zones.
 - Hard exclusions remove a zone when an enabled layer covers at least its threshold share of the zone (0.05-1).
 - "cluster" mode runs k-means on the percentiles of the enabled features instead (weights are ignored).
+
+You also have Homes England programme documents (funding guidance and prospectuses), searchable with \
+file_search (each document starts with its title, source URL and last updated date). When the user mentions a programme, fund or policy (e.g. "candidates for \
+the BIL Fund"), ground your answer in it: search for its eligibility, prioritisation and assessment criteria \
+(several targeted searches are fine), then map each criterion to the engine's features and exclusions. Say \
+explicitly which criteria the data can't represent (e.g. viability, applicant type, economic growth potential) \
+rather than inventing proxies, and cite the sections you relied on by name.
 
 The user describes what they want to see. Your job:
 1. Call describe_data to learn the features, exclusions and their distributions (once is usually enough).
@@ -46,74 +67,113 @@ Keep the user's current zones and mode unless their request implies a change. If
 make a sensible choice and say what you assumed rather than asking."""
 
 
+def config_arg(description):
+    return {"type": "object", "properties": {"config_yaml": {"type": "string", "description": description}},
+            "required": ["config_yaml"]}
+
+
+TOOLS = [
+    FunctionTool(name="describe_data", strict=False,
+                 description="Describe zone levels, hard-exclusion layers and features (with distributions and "
+                             "the most correlated feature pairs) at a given zone level.",
+                 parameters={"type": "object", "properties": {"zones": {
+                     "type": "string", "description": "Zone level: h3_8, h3_7, msoa or boroughs (default h3_8)"}}}),
+    FunctionTool(name="preview_config", strict=False,
+                 description="Evaluate a config (YAML string) without changing the user's map. Returns exclusion "
+                             "counts and the top/bottom zones (score mode) or cluster sizes and profiles (cluster mode).",
+                 parameters=config_arg("Config in the app's YAML export format")),
+    FunctionTool(name="apply_config", strict=False,
+                 description="Load the final config (YAML string) into the user's map. Call exactly once.",
+                 parameters=config_arg("Final config in the app's YAML export format")),
+]
+
+
 def text(obj):
-    return {"content": [{"type": "text", "text": obj if isinstance(obj, str) else json.dumps(obj, indent=1)}]}
+    return obj if isinstance(obj, str) else json.dumps(obj, indent=1)
 
 
-def make_server(describe, evaluate, on_apply):
-    """Tools are built per request so apply_config can hand its config back to this request's stream."""
-
-    @tool("describe_data", "Describe zone levels, hard-exclusion layers and features (with distributions and "
-          "the most correlated feature pairs) at a given zone level.", {"zones": str})
-    async def describe_data(args):
+def run_tool(name, args, describe, evaluate, on_apply):
+    """Runs one function call from the agent; errors are returned as text so the agent can fix its input."""
+    if name == "describe_data":
         return text(describe(args.get("zones") or "h3_8"))
-
-    @tool("preview_config", "Evaluate a config (YAML string) without changing the user's map. Returns exclusion "
-          "counts and the top/bottom zones (score mode) or cluster sizes and profiles (cluster mode).",
-          {"config_yaml": str})
-    async def preview_config(args):
-        try:
-            return text(evaluate(yaml.safe_load(args["config_yaml"]) or {}))
-        except Exception as e:  # invalid YAML or config: let the agent fix it
-            return {"content": [{"type": "text", "text": f"Invalid config: {e}"}], "is_error": True}
-
-    @tool("apply_config", "Load the final config (YAML string) into the user's map. Call exactly once.",
-          {"config_yaml": str})
-    async def apply_config(args):
+    if name in ("preview_config", "apply_config"):
         try:
             cfg = yaml.safe_load(args["config_yaml"]) or {}
-            evaluate(cfg)  # validates
-        except Exception as e:
-            return {"content": [{"type": "text", "text": f"Invalid config: {e}"}], "is_error": True}
+            result = evaluate(cfg)  # validates
+        except Exception as e:  # invalid YAML or config: let the agent fix it
+            return f"Invalid config: {e}"
+        if name == "preview_config":
+            return text(result)
         CONFIGS.mkdir(exist_ok=True)
         path = CONFIGS / f"agent-{datetime.now():%Y%m%d-%H%M%S}.yaml"
         path.write_text(args["config_yaml"])
         on_apply(cfg, path.name)
-        return text(f"Config loaded into the map (saved as configs/{path.name}).")
+        return f"Config loaded into the map (saved as configs/{path.name})."
+    return f"Unknown tool {name!r}"
 
-    tools = [describe_data, preview_config, apply_config]
-    return create_sdk_mcp_server(name="engine", tools=tools), [f"mcp__engine__{t.name}" for t in tools]
+
+_openai = None  # AsyncOpenAI client for the project, created (and the agent registered) on first chat
+
+
+async def client():
+    global _openai
+    if _openai is None:
+        project = AIProjectClient(endpoint=ENDPOINT, credential=DefaultAzureCredential())
+        openai = project.get_openai_client()
+        stores = [vs.id async for vs in openai.vector_stores.list() if vs.name == VECTOR_STORE]
+        if not stores:
+            raise RuntimeError(f"No vector store {VECTOR_STORE!r} in the Foundry project: run uv run refresh/docs_sync.py")
+        definition = PromptAgentDefinition(model=MODEL, instructions=SYSTEM_PROMPT,
+                                           tools=TOOLS + [FileSearchTool(vector_store_ids=stores[:1])])
+        digest = hashlib.sha256(json.dumps(definition.as_dict(), sort_keys=True).encode()).hexdigest()[:16]
+        try:
+            latest = (await project.agents.get(AGENT_NAME)).versions.latest
+            current = (latest.metadata or {}).get("definition_hash") == digest
+        except Exception:  # agent doesn't exist yet
+            current = False
+        if not current:  # new agent, or this code's instructions/tools differ from the latest version
+            await project.agents.create_version(AGENT_NAME, definition=definition,
+                                                metadata={"definition_hash": digest},
+                                                description="Homes England investment decision engine analyst")
+        _openai = openai
+    return _openai
 
 
 async def chat(message, current_config, session_id, describe, evaluate):
-    """Run one agent turn; yields events for the UI: text, tool, config, done/error."""
+    """Run one agent turn; yields events for the UI: text, tool, config, done/error.
+
+    session_id is the Foundry conversation id: follow-up messages continue the same conversation."""
     applied = []
-    server, tool_names = make_server(describe, evaluate, lambda cfg, name: applied.append((cfg, name)))
-    options = ClaudeAgentOptions(
-        model=MODEL,
-        system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"engine": server},
-        tools=[],                      # no built-in tools (shell, files, web)
-        allowed_tools=tool_names,
-        permission_mode="dontAsk",     # anything else is denied without prompting
-        setting_sources=[],            # ignore local Claude Code settings / CLAUDE.md
-        resume=session_id,             # continue the same conversation across messages
-        max_turns=25,
-    )
-    prompt = f"{message}\n\n<current_config>\n{current_config}\n</current_config>"
     try:
-        async for msg in query(prompt=prompt, options=options):
-            while applied:  # apply_config just ran: push the config to the map straight away
-                cfg, name = applied.pop(0)
-                yield {"type": "config", "config": cfg, "file": name}
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        yield {"type": "text", "text": block.text}
-                    elif isinstance(block, ToolUseBlock):
-                        yield {"type": "tool", "name": block.name.removeprefix("mcp__engine__")}
-            elif isinstance(msg, ResultMessage):
-                yield {"type": "done", "session_id": msg.session_id, "cost_usd": msg.total_cost_usd,
-                       "error": msg.is_error}
+        openai = await client()
+        conversation = session_id or (await openai.conversations.create()).id
+        items = [{"type": "message", "role": "user",
+                  "content": f"{message}\n\n<current_config>\n{current_config}\n</current_config>"}]
+        tokens = 0
+        for _ in range(MAX_TURNS):
+            response = await openai.responses.create(
+                conversation=conversation, input=items,
+                extra_body={"agent_reference": {"name": AGENT_NAME, "type": "agent_reference"}})
+            tokens += response.usage.total_tokens if response.usage else 0
+            items = []  # outputs of this round's function calls, sent back in the next request
+            for out in response.output:
+                if out.type == "message":
+                    reply = CITATION.sub("", "".join(c.text for c in out.content if c.type == "output_text"))
+                    if reply.strip():
+                        yield {"type": "text", "text": reply}
+                elif out.type == "file_search_call":  # runs in Foundry: only shown in the UI
+                    yield {"type": "tool", "name": "file_search"}
+                elif out.type == "function_call":
+                    yield {"type": "tool", "name": out.name}
+                    result = run_tool(out.name, json.loads(out.arguments or "{}"), describe, evaluate,
+                                      lambda cfg, name: applied.append((cfg, name)))
+                    while applied:  # apply_config just ran: push the config to the map straight away
+                        cfg, name = applied.pop(0)
+                        yield {"type": "config", "config": cfg, "file": name}
+                    items.append({"type": "function_call_output", "call_id": out.call_id, "output": result})
+            if not items:  # no function calls: the agent has answered
+                yield {"type": "done", "session_id": conversation, "tokens": tokens, "error": False}
+                return
+        yield {"type": "done", "session_id": conversation, "tokens": tokens, "error": True}  # hit MAX_TURNS
     except Exception as e:
         yield {"type": "error", "text": str(e)}

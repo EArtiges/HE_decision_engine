@@ -40,3 +40,15 @@ Homes England lends to developers, including SME builders. A credit analyst want
 
 How the engine answers it: partly, today. The tooltip shows one area's values, but the agent can only see the top and bottom of a ranking, not a named zone.
 What's missing: a small zone_profile tool that returns one zone's features, percentiles and constraint coverage. That would let the agent answer this properly, and it's the cheapest gap to close of the four.
+
+# 5. BIL Fund
+
+"We're building a pipeline for the Brownfield, Infrastructure and Land Fund. Using the fund's prioritisation criteria, show me the MSOAs with the most developable brownfield land that wouldn't be held up by flood risk or protected habitats. Tell me which of the fund's criteria you couldn't assess from our data."
+
+This makes the agent find "How we prioritise applications", weight brownfield land and scale, exclude constrained zones (the brief's "early delivery" angle), and list the criteria it can't cover, such as viability, "would stall without funding" and value for money.
+
+# 6. SAHP 2026–2036
+
+"Ahead of the next round of Strategic Partnership bids for the Social and Affordable Homes Programme, group the boroughs into 4 types based on what the prospectus says we assess bids on. Which type should we prioritise for partnership conversations?"
+
+This makes the agent search "How we assess bids for funding" (value for money, strategic fit, deliverability) and the funding priorities, switch to boroughs in cluster mode, then use the cluster profiles to recommend one group. That also shows off the profiles panel and hover highlighting during the demo.

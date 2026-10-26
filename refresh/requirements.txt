@@ -1,0 +1,4 @@
+azure-functions
+azure-ai-projects>=2.9.0
+azure-identity
+markdownify>=1.2.3

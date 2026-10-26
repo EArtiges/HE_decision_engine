@@ -158,7 +158,8 @@ def cluster(body: ClusterRequest):
 
 DESCRIPTIONS = {
     "population": "Resident population",
-    "station_count": "Number of rail / Underground / Overground stations",
+    "station_count": "Number of rail / Underground / Overground stations. DATA GAP: only populated for inner "
+                     "London in the source data (0 in every outer borough), so it is unreliable outside inner London",
     "cbd_distance_m": "Distance to central London in metres (higher = further out)",
     "green_belt_pct": "Share of the zone designated Green Belt, in %",
     "brownfield_ha": "Brownfield land register sites, in hectares",
