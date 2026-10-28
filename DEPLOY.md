@@ -14,6 +14,7 @@ When you're done, you'll have:
 | Container App, its environment, registry and Log Analytics workspace | Runs the app (FastAPI + map) | 9 |
 | Entra app registration | Sign-in in front of the app | 11 |
 | Function app and its storage account (optional) | Refreshes the documents daily | 12 |
+| Managed identity `id-he-decision-engine-github` | Lets GitHub Actions deploy on every push to `main` | 13 |
 
 ## Before you start
 
@@ -235,11 +236,65 @@ To check:
 1. In the portal, open the function app, then the `refresh_documents` function, and click **Test/Run**.
 2. Check the log. A run with no changes logs `unchanged` for each document.
 
+## 13. Deploy automatically from GitHub
+
+*Not yet run.* [.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs on every push to `main`, and from the Actions tab (**Run workflow**). It does three things:
+1. builds the image in the container registry, tagged with the commit SHA
+2. points the Container App at the new image
+3. checks that the app responds within 5 minutes
+
+GitHub signs in to Azure through OpenID Connect, as a user-assigned managed identity. There's no secret to store or rotate, and no Entra app registration is needed.
+
+**1. Create the identity and let GitHub's `main` branch sign in as it:**
+
+```sh
+REPO=EArtiges/HE_decision_engine          # the client's repo, as owner/name
+ID_NAME=id-$APP-github
+
+az identity create -n $ID_NAME -g $RG -l $LOC
+az identity federated-credential create -n github-main --identity-name $ID_NAME -g $RG \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject repo:$REPO:ref:refs/heads/main \
+  --audiences api://AzureADTokenExchange
+```
+
+The federated credential only accepts tokens from workflows running on `main` in that repo. Runs on other branches or forks can't sign in.
+
+**2. Let the identity build images and update the app:**
+
+```sh
+GH_ID=$(az identity show -n $ID_NAME -g $RG --query principalId -o tsv)
+az role assignment create --assignee-object-id $GH_ID --assignee-principal-type ServicePrincipal \
+  --role Contributor --scope $(az group show -n $RG --query id -o tsv)
+```
+
+Contributor on the app's resource group covers both cloud builds and app updates. It can't touch the Foundry resource or anything outside that resource group.
+
+**3. Give the repo the IDs.** On GitHub, go to **Settings**, **Secrets and variables**, **Actions**, then the **Variables** tab. Add three repository variables:
+
+| Variable | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | `az identity show -n $ID_NAME -g $RG --query clientId -o tsv` |
+| `AZURE_TENANT_ID` | `az account show --query tenantId -o tsv` |
+| `AZURE_SUBSCRIPTION_ID` | `az account show --query id -o tsv` |
+
+They're IDs, not secrets, so they're variables.
+
+**4. Check the names in the workflow.** The `env:` block at the top of `deploy.yml` names this instance's resource group, app and registry. For a client's copy of the repo, change them. Look up the registry name with `az acr list -g $RG --query "[].name" -o tsv`.
+
+Then trigger a run with **Run workflow**, or push to `main`.
+
+Every deploy leaves an image in the registry. To delete all but the 10 most recent:
+
+```sh
+az acr run --registry <registry> --cmd "acr purge --filter '$APP:.*' --keep 10 --ago 0d --untagged" /dev/null
+```
+
 ## Keeping an instance up to date
 
 | Change | What to run |
 |---|---|
-| App code | Step 9 again. If the agent's instructions or tools changed, the first chat registers a new agent version. |
+| App code | Push to `main`, which deploys it (step 13). Without the workflow, run step 9 again. If the agent's instructions or tools changed, the first chat registers a new agent version. |
 | Programme documents (a new entry in `SOURCES`, or a GOV.UK update) | `uv run refresh/docs_sync.py` (step 7), or wait for the daily Function if it's deployed. Only changed documents are uploaded again. |
 | Data tables | `uv run prepare_data.py`, then step 9. The tables are built into the image. |
 
@@ -253,6 +308,8 @@ To check:
 | 401 or 403 from Foundry, or `AuthorizationPermissionMismatch` | Role missing or not yet applied | Steps 5, 10 or 12, then wait up to 10 minutes |
 | `Role 'Azure AI User' doesn't exist` | The role was renamed | Use `Foundry User` |
 | The agent keeps changing between versions | Two copies of the app with different code share an agent name | A separate `FOUNDRY_AGENT_NAME` per copy (step 8) |
+| `AADSTS700213` or `No matching federated identity record` in the workflow's login step | The run isn't from `main` in the repo named in the federated credential | Check `--subject` in step 13 matches `repo:<owner>/<name>:ref:refs/heads/main` |
+| `AuthorizationFailed` in the workflow's build or update step | The GitHub identity has no role on the resource group, or it hasn't applied yet | Step 13, part 2, then wait up to 10 minutes |
 | Saved configs disappear | `configs/` is on the container's disk, which is wiped on every restart or redeploy | Planned move to Blob Storage (below) |
 
 ## Not covered yet

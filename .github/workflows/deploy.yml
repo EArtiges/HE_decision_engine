@@ -1,0 +1,56 @@
+# Builds the container image in Azure Container Registry and rolls it out to the Container App on every push to main.
+# Azure sign-in is OIDC against a user-assigned managed identity, so there are no secrets: see DEPLOY.md, step 13.
+name: Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # redeploy main by hand from the Actions tab
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false   # let a running deploy finish; the next one starts after it
+
+env:   # this instance's names: change them for a client's copy of the repo
+  RESOURCE_GROUP: rg-he-decision-engine
+  CONTAINER_APP: he-decision-engine
+  REGISTRY: ca71e048ef67acr
+  IMAGE: he-decision-engine
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build the image in the registry
+        run: az acr build --registry "$REGISTRY" --image "$IMAGE:$GITHUB_SHA" .
+
+      - name: Roll out the new image
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          az containerapp update -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --image "$REGISTRY.azurecr.io/$IMAGE:$GITHUB_SHA" --only-show-errors
+
+      - name: Check the app responds
+        run: |
+          fqdn=$(az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          # the new revision loads the data tables at startup; a sign-in redirect (302) also counts as up
+          for i in $(seq 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://$fqdn/" || true)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then exit 0; fi
+            sleep 10
+          done
+          echo "The app didn't respond after 5 minutes: check az containerapp logs show -n $CONTAINER_APP -g $RESOURCE_GROUP"
+          exit 1

@@ -60,6 +60,8 @@ The tables in `data/levels/` are committed, so you only need to run `prepare_dat
 
 The app runs on Azure Container Apps (`he-decision-engine` in `rg-he-decision-engine`, UK South). It's built from the `Dockerfile`, and the data tables are included in the image. Its managed identity calls Foundry, so there are no keys or secrets.
 
+Every push to `main` builds a new image and deploys it, through the GitHub Actions workflow in `.github/workflows/deploy.yml`. Setting it up is step 13 of DEPLOY.md.
+
 [DEPLOY.md](DEPLOY.md) lists every Azure CLI command, in order, to set up a new instance, for example for a client. It also covers redeploying and troubleshooting.
 
 Not done yet:
