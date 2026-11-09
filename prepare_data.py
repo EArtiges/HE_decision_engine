@@ -39,6 +39,20 @@ SUMMED = {"population", "station_count"}
 
 
 def get_json(url, retries=4):
+    """GET a URL and decode its JSON body, retrying on failure.
+
+    Waits 5 s, 10 s, 15 s... between attempts.
+
+    Args:
+        url: URL to fetch.
+        retries: Total number of attempts.
+
+    Returns:
+        The decoded JSON.
+
+    Raises:
+        Exception: Whatever the last attempt raised, once every attempt has failed.
+    """
     for attempt in range(retries):
         try:
             with urlopen(url, timeout=600) as r:
@@ -50,6 +64,17 @@ def get_json(url, retries=4):
 
 
 def fetch_planning_tile(dataset, bounds):
+    """All features of a planning.data.gov.uk dataset that intersect one bounding box.
+
+    Follows the API's pagination 500 features at a time.
+
+    Args:
+        dataset: planning.data.gov.uk dataset name, e.g. ``"flood-risk-zone"``.
+        bounds: ``(x0, y0, x1, y1)`` box in WGS84 degrees.
+
+    Returns:
+        List of GeoJSON feature dicts.
+    """
     x0, y0, x1, y1 = bounds
     wkt = f"POLYGON(({x0} {y0},{x1} {y0},{x1} {y1},{x0} {y1},{x0} {y0}))"
     features, offset = [], 0
@@ -64,7 +89,18 @@ def fetch_planning_tile(dataset, bounds):
 
 
 def planning_layer(dataset, london):
-    """All features of a planning.data.gov.uk dataset intersecting London, clipped to London. Cached."""
+    """All features of a planning.data.gov.uk dataset intersecting London, clipped to London. Cached.
+
+    The first call downloads London in small tiles, 8 in parallel, then removes duplicate entities, repairs
+    invalid geometries and saves the result to data/raw/<dataset>.parquet. Later calls read that file.
+
+    Args:
+        dataset: planning.data.gov.uk dataset name, e.g. ``"green-belt"``.
+        london: GeoDataFrame of London's boundary (the boroughs) in WGS84.
+
+    Returns:
+        GeoDataFrame of the dataset's features in WGS84, clipped to London.
+    """
     path = RAW / f"{dataset}.parquet"
     if path.exists():
         return gpd.read_parquet(path)
@@ -85,6 +121,16 @@ def planning_layer(dataset, london):
 
 
 def london_msoas(borough_names):
+    """London's 2021 MSOA boundaries from the ONS ArcGIS service. Cached in data/raw/msoa.parquet.
+
+    Downloads every MSOA in a box around London, then keeps those whose name starts with a London borough.
+
+    Args:
+        borough_names: Set of London local authority names (MSOA names are ``"<local authority> <nnn>"``).
+
+    Returns:
+        GeoDataFrame in WGS84 with ``MSOA21CD``, ``MSOA21NM`` and ``geometry`` columns.
+    """
     path = RAW / "msoa.parquet"
     if path.exists():
         return gpd.read_parquet(path)
@@ -110,6 +156,13 @@ def chop(geoms, size=1000):
 
     Unioned layers can be a few huge polygons (e.g. the Thames floodplain); intersecting zones against
     small tiles instead is orders of magnitude faster. Pieces are disjoint, so their areas can be summed.
+
+    Args:
+        geoms: Array of shapely geometries in British National Grid.
+        size: Tile side length in metres.
+
+    Returns:
+        GeoSeries (BNG) of the non-empty pieces of the union, one per tile it overlaps; empty if the union is.
     """
     union = shapely.union_all(geoms)
     if union.is_empty:
@@ -125,7 +178,15 @@ def chop(geoms, size=1000):
 
 
 def coverage(zones, parts):
-    """Share of each zone's area covered by `parts` (disjoint pieces from chop(), both in BNG)."""
+    """Share of each zone's area covered by `parts` (disjoint pieces from chop(), both in BNG).
+
+    Args:
+        zones: GeoSeries of zone polygons in BNG.
+        parts: GeoSeries of disjoint pieces from ``chop`` in BNG.
+
+    Returns:
+        Array with one value in [0, 1] per zone.
+    """
     if len(parts) == 0:
         return np.zeros(len(zones))
     zi, pi = parts.sindex.query(zones.values, predicate="intersects")
@@ -134,7 +195,20 @@ def coverage(zones, parts):
 
 
 def area_weighted(zones, cells, values, features):
-    """Apportion base-cell values to zones by overlapping area: totals split by area share, others area-averaged."""
+    """Apportion base-cell values to zones by overlapping area: totals split by area share, others area-averaged.
+
+    Counts (``SUMMED`` and ``poi_*`` features) are split in proportion to the share of each cell's area that
+    falls in the zone. Other features are averaged over the cells, weighted by overlapping area.
+
+    Args:
+        zones: GeoSeries of zone polygons in BNG.
+        cells: GeoSeries of base H3 cells in BNG.
+        values: Array of shape (cells, features) with the base cells' feature values.
+        features: Feature names, one per column of ``values``.
+
+    Returns:
+        DataFrame with one row per zone and one column per feature.
+    """
     zi, ci = cells.sindex.query(zones.values, predicate="intersects")
     a = shapely.area(shapely.intersection(zones.values[zi], cells.values[ci]))
     w = a / shapely.area(cells.values[ci])
@@ -149,6 +223,13 @@ def area_weighted(zones, cells, values, features):
 
 
 def main():
+    """Build data/levels/<level>.parquet for each zone level (H3 8, H3 7, MSOA, boroughs).
+
+    Starts from the H3 resolution 8 base dataset (population, stations, distance to central London, POI
+    counts). Downloads the planning layers and MSOA boundaries, and aggregates the base features to each level.
+    Then adds Green Belt %, brownfield hectares and the coverage of each hard-exclusion layer (``cov_*``
+    columns). Geometries are saved in WGS84; MSOA and borough outlines are simplified.
+    """
     RAW.mkdir(parents=True, exist_ok=True)
     LEVELS.mkdir(parents=True, exist_ok=True)
 

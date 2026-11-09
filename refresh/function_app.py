@@ -10,4 +10,9 @@ app = func.FunctionApp()
 
 @app.timer_trigger(schedule="0 0 6 * * *", arg_name="timer")
 def refresh_documents(timer: func.TimerRequest):
+    """Timer trigger: sync the programme documents into the vector store and log what changed.
+
+    Args:
+        timer: Azure Functions timer info (unused).
+    """
     logging.info("Document refresh: %s", docs_sync.sync())

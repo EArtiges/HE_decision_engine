@@ -68,6 +68,14 @@ make a sensible choice and say what you assumed rather than asking."""
 
 
 def config_arg(description):
+    """JSON schema for a function tool whose only argument is a config as a YAML string.
+
+    Args:
+        description: Description of the ``config_yaml`` argument shown to the model.
+
+    Returns:
+        JSON schema dict for an object with one required string property, ``config_yaml``.
+    """
     return {"type": "object", "properties": {"config_yaml": {"type": "string", "description": description}},
             "required": ["config_yaml"]}
 
@@ -89,11 +97,34 @@ TOOLS = [
 
 
 def text(obj):
+    """Format a tool result as text for the model.
+
+    Args:
+        obj: A string, or any JSON-serialisable value.
+
+    Returns:
+        ``obj`` unchanged if it is a string, otherwise its indented JSON.
+    """
     return obj if isinstance(obj, str) else json.dumps(obj, indent=1)
 
 
 def run_tool(name, args, describe, evaluate, on_apply):
-    """Runs one function call from the agent; errors are returned as text so the agent can fix its input."""
+    """Runs one function call from the agent; errors are returned as text so the agent can fix its input.
+
+    ``apply_config`` also saves the YAML to configs/ and hands the config to ``on_apply`` so it can be pushed to
+    the user's map.
+
+    Args:
+        name: Tool name: ``describe_data``, ``preview_config`` or ``apply_config``.
+        args: Tool arguments decoded from the model's JSON (``zones`` or ``config_yaml``).
+        describe: Callable(level) -> dict describing the data (``app.describe``).
+        evaluate: Callable(config dict) -> dict summarising its result, raising on an invalid config
+            (``app.evaluate``).
+        on_apply: Callable(config dict, saved filename) called when ``apply_config`` succeeds.
+
+    Returns:
+        The tool output to send back to the model, as text.
+    """
     if name == "describe_data":
         return text(describe(args.get("zones") or "h3_8"))
     if name in ("preview_config", "apply_config"):
@@ -116,6 +147,18 @@ _openai = None  # AsyncOpenAI client for the project, created (and the agent reg
 
 
 async def client():
+    """OpenAI client for the Foundry project, with the agent registered and up to date.
+
+    On first call, connects to the project, finds the programme documents vector store and registers a new
+    agent version if the agent doesn't exist yet or its definition (instructions, model, tools) has changed
+    since the latest version. Later calls return the cached client.
+
+    Returns:
+        The project's AsyncOpenAI client.
+
+    Raises:
+        RuntimeError: If the ``VECTOR_STORE`` vector store doesn't exist in the project.
+    """
     global _openai
     if _openai is None:
         project = AIProjectClient(endpoint=ENDPOINT, credential=DefaultAzureCredential())
@@ -142,7 +185,24 @@ async def client():
 async def chat(message, current_config, session_id, describe, evaluate):
     """Run one agent turn; yields events for the UI: text, tool, config, done/error.
 
-    session_id is the Foundry conversation id: follow-up messages continue the same conversation."""
+    session_id is the Foundry conversation id: follow-up messages continue the same conversation.
+
+    The model and the local function tools take turns until the model answers without calling a function, or
+    ``MAX_TURNS`` round trips have been made.
+
+    Args:
+        message: The user's message.
+        current_config: The user's current sidebar config as YAML, sent with the message as context.
+        session_id: Foundry conversation id from a previous turn, or None to start a new conversation.
+        describe: Callable(level) -> dict for the describe_data tool (``app.describe``).
+        evaluate: Callable(config dict) -> dict for the preview and apply tools (``app.evaluate``).
+
+    Yields:
+        Event dicts: ``{"type": "text", "text"}`` for agent replies (citation markers removed),
+        ``{"type": "tool", "name"}`` for each tool call, ``{"type": "config", "config", "file"}`` when a config
+        is applied, then ``{"type": "done", "session_id", "tokens", "error"}`` (``error`` is True if
+        ``MAX_TURNS`` was hit), or ``{"type": "error", "text"}`` if anything raised.
+    """
     applied = []
     try:
         openai = await client()

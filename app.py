@@ -27,11 +27,32 @@ EXCLUSIONS = {"flood": "Flood zones 2 & 3", "habitats": "Protected habitats", "m
 
 
 def ring(coords):
+    """Convert a polygon ring to a JSON-friendly list of points rounded to 5 decimals.
+
+    Five decimal places of a degree is about 1 m, which is ample for display and keeps the /meta payload small.
+
+    Args:
+        coords: Iterable of (x, y) coordinate pairs, e.g. a shapely exterior's ``coords``.
+
+    Returns:
+        List of ``[x, y]`` lists with each coordinate rounded to 5 decimal places.
+    """
     return [[round(x, 5), round(y, 5)] for x, y in coords]
 
 
 def load_level(key):
-    g = gpd.read_parquet(DATA / f"{key}.parquet")
+    """Load one zone level's feature table (built by prepare_data.py) into memory.
+
+    Args:
+        key: Zone level key, one of ``LEVEL_LABELS`` (e.g. ``"h3_8"`` or ``"boroughs"``).
+
+    Returns:
+        A ``(features, level)`` tuple. ``features`` lists the feature column names. ``level`` is a dict with:
+        ``cells`` (zone id and polygon rings per zone, for the map), ``raw`` (feature values rounded to 1
+        decimal, one row per zone), ``norm`` (percentile rank of each feature in [0, 1], as a float array of
+        shape (zones, features)) and ``cov`` (exclusion layer key -> share of each zone it covers).
+    """
+    g =gpd.read_parquet(DATA / f"{key}.parquet")
     feats = [c for c in g.columns if c not in ("zone_id", "geometry") and not c.startswith("cov_")]
     return feats, {
         # A zone can have several polygons (e.g. boroughs split by the Thames).
@@ -57,6 +78,15 @@ LABELS = {"cbd_distance_m": "CBD distance (m)", "green_belt_pct": "Green Belt co
 
 
 def group(c):
+    """Sidebar group a feature is listed under.
+
+    Args:
+        c: Feature column name.
+
+    Returns:
+        ``"Amenities (POI count)"`` for ``poi_*`` features, ``"Policy"`` for Green Belt and brownfield,
+        otherwise ``"Core"``.
+    """
     if c.startswith("poi_"):
         return "Amenities (POI count)"
     if c in ("green_belt_pct", "brownfield_ha"):
@@ -65,7 +95,16 @@ def group(c):
 
 
 def label(c):
-    s = LABELS.get(c) or c.removeprefix("poi_").replace("_", " ")
+    """Human-readable label for a feature.
+
+    Args:
+        c: Feature column name.
+
+    Returns:
+        The label from ``LABELS`` if there is one, otherwise the column name without its ``poi_`` prefix and
+        with underscores as spaces, in sentence case (e.g. ``"poi_health_care"`` -> ``"Health care"``).
+    """
+    s =LABELS.get(c) or c.removeprefix("poi_").replace("_", " ")
     return s[0].upper() + s[1:]
 
 
@@ -76,12 +115,30 @@ app = FastAPI()
 
 @app.get("/")
 def index():
+    """Serve the single-page front end.
+
+    Returns:
+        index.html as a file response.
+    """
     return FileResponse(HERE / "index.html")
 
 
 @app.get("/meta")
 def meta(level: str = BASE_LEVEL):
-    L = LEVELS[level]
+    """Everything the front end needs to draw a zone level and build its sidebar.
+
+    Args:
+        level: Zone level key (defaults to ``BASE_LEVEL``).
+
+    Returns:
+        Dict with the available ``levels``, the hard ``exclusions``, the ``features`` (key, label, group,
+        default weight and how base cells were aggregated), the zone ``cells`` (polygons), the ``raw`` feature
+        values per zone and each exclusion layer's ``cov`` share per zone (for the tooltip).
+
+    Raises:
+        KeyError: If ``level`` is not a known zone level.
+    """
+    L =LEVELS[level]
     return {
         "levels": [{"key": k, "label": v} for k, v in LEVEL_LABELS.items()],
         "exclusions": [{"key": k, "label": v} for k, v in EXCLUSIONS.items()],
@@ -99,7 +156,15 @@ class Weights(BaseModel):
 
 
 def excluded_mask(body):
-    """Zones where any enabled exclusion layer covers at least its own threshold."""
+    """Zones where any enabled exclusion layer covers at least its own threshold.
+
+    Args:
+        body: Request with ``level`` and ``exclusions`` (exclusion layer key -> coverage threshold in [0, 1]).
+            Unknown layer keys are ignored.
+
+    Returns:
+        Boolean array with one entry per zone of the level, True where the zone is excluded.
+    """
     L = LEVELS[body.level]
     mask = np.zeros(len(L["norm"]), dtype=bool)
     for g, t in body.exclusions.items():
@@ -109,7 +174,15 @@ def excluded_mask(body):
 
 
 def with_gaps(values, mask):
-    """Full-length list with None for excluded zones."""
+    """Full-length list with None for excluded zones.
+
+    Args:
+        values: One value per surviving zone, in zone order.
+        mask: Boolean exclusion mask from ``excluded_mask``, one entry per zone.
+
+    Returns:
+        List as long as ``mask``: the values in the positions of non-excluded zones, None elsewhere.
+    """
     out = [None] * len(mask)
     for i, v in zip(np.flatnonzero(~mask), values):
         out[i] = v
@@ -118,7 +191,19 @@ def with_gaps(values, mask):
 
 @app.post("/score")
 def score(body: Weights):
-    w = np.zeros(len(FEATURES))
+    """Score every zone as a weighted sum of feature percentiles.
+
+    The score of a zone is the sum of weight x feature percentile over the weighted features. Scores are then
+    turned into percentiles among the zones that survive the hard exclusions.
+
+    Args:
+        body: Feature weights in [-1, 1] (unknown keys are ignored), zone level and enabled exclusions.
+
+    Returns:
+        Dict with ``pct``, the score percentile of each zone rounded to 4 decimals (None for excluded zones,
+        0.5 for all zones when every weight is zero), and ``excluded``, the number of excluded zones.
+    """
+    w =np.zeros(len(FEATURES))
     for k, v in body.weights.items():
         if k in IDX:
             w[IDX[k]] = v
@@ -135,6 +220,21 @@ class ClusterRequest(Weights):
 
 @app.post("/cluster")
 def cluster(body: ClusterRequest):
+    """Group the surviving zones with k-means on the percentiles of the switched-on features.
+
+    Weights are ignored: only which features are present in ``body.weights`` matters. The seed is fixed and
+    clusters are numbered from largest to smallest, so the same inputs always give the same labels and colours.
+
+    Args:
+        body: Switched-on features (as ``weights`` keys), zone level, enabled exclusions and ``n_clusters``.
+            The number of clusters is capped at the number of surviving zones.
+
+    Returns:
+        Dict with ``labels`` (cluster id per zone, None for excluded zones), ``keys`` (the features used),
+        ``centers`` (one row per cluster: centre percentile 0-100 of each feature in ``keys``) and
+        ``excluded`` (number of excluded zones). With no features, a single cluster or no surviving zones,
+        every zone gets label 0.
+    """
     # Vector per surviving zone = percentiles of the features switched on (weights are ignored).
     keys = [k for k in body.weights if k in IDX]
     mask = excluded_mask(body)
@@ -173,6 +273,20 @@ EXCLUSION_DESCRIPTIONS = {
 
 
 def describe(level):
+    """Describe the data at one zone level, for the chat agent's describe_data tool.
+
+    Args:
+        level: Zone level key.
+
+    Returns:
+        Dict with the number of zones per level (``zone_levels``), the ``described_level``, each feature's
+        label, group, aggregation, description, quartiles and share of zones at zero (``features``), the 12
+        most correlated feature pairs by Spearman correlation (``most_correlated_feature_pairs``) and each
+        exclusion layer's description and zone counts at 50% and full coverage (``hard_exclusions``).
+
+    Raises:
+        ValueError: If ``level`` is not a known zone level.
+    """
     if level not in LEVELS:
         raise ValueError(f"Unknown zones {level!r}; use one of {list(LEVELS)}")
     L = LEVELS[level]
@@ -199,7 +313,22 @@ def describe(level):
 
 
 def parse_config(cfg):
-    """Config dict (export format) -> (request, mode). Raises ValueError on invalid content."""
+    """Config dict (export format) -> (request, mode). Raises ValueError on invalid content.
+
+    Features and exclusions that are missing or not enabled are switched off. Numbers are clipped to their
+    valid range: ``n_clusters`` to 1-10, weights to [-1, 1] and thresholds to [0.05, 1].
+
+    Args:
+        cfg: Parsed config, as written by the front end's YAML export (keys ``zones``, ``mode``,
+            ``n_clusters``, ``hard_exclusions`` and ``features``).
+
+    Returns:
+        A ``(request, mode)`` tuple: a ``ClusterRequest`` usable by both ``score`` and ``cluster``, and the
+        mode, ``"score"`` or ``"cluster"``.
+
+    Raises:
+        ValueError: If the zone level or mode is unknown, or a feature or exclusion key doesn't exist.
+    """
     level = cfg.get("zones", BASE_LEVEL)
     if level not in LEVELS:
         raise ValueError(f"Unknown zones {level!r}; use one of {list(LEVELS)}")
@@ -220,7 +349,20 @@ def parse_config(cfg):
 
 
 def evaluate(cfg):
-    """Summary of what a config produces, for the agent to check its work."""
+    """Summary of what a config produces, for the agent to check its work.
+
+    Args:
+        cfg: Parsed config in the export format (see ``parse_config``).
+
+    Returns:
+        Dict with the ``zones`` level, ``mode``, ``total_zones`` and ``excluded`` count. In cluster mode it also
+        has ``cluster_sizes`` and ``cluster_centre_percentiles`` (feature -> centre percentile, per cluster). In
+        score mode it has ``top_10`` and ``bottom_5``: zone id, score percentile and raw values of the enabled
+        features.
+
+    Raises:
+        ValueError: If the config is invalid (see ``parse_config``).
+    """
     req, mode = parse_config(cfg)
     L = LEVELS[req.level]
     ids = [c["id"] for c in L["cells"]]
@@ -249,8 +391,21 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
-    """Streams agent events as newline-delimited JSON."""
+    """Streams agent events as newline-delimited JSON.
+
+    Args:
+        body: The user's message, their current sidebar config as YAML and, to continue a conversation, the
+            session id returned by the previous turn.
+
+    Returns:
+        A streaming ``application/x-ndjson`` response with one JSON event per line (see ``agent.chat``).
+    """
     async def events():
+        """Serialise each agent event as one line of JSON.
+
+        Yields:
+            Each event from ``agent.chat`` as a JSON string ending in a newline.
+        """
         async for e in agent.chat(body.message, body.config_yaml, body.session_id, describe, evaluate):
             yield json.dumps(e) + "\n"
     return StreamingResponse(events(), media_type="application/x-ndjson")

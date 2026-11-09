@@ -146,13 +146,36 @@ const DESC = {
 };
 
 const RED = [215, 48, 39], WHITE = [255, 255, 255], GREEN = [26, 152, 80];
+/**
+ * Linear interpolation between two RGB colours.
+ * @param {number[]} a - Start colour [r, g, b].
+ * @param {number[]} b - End colour [r, g, b].
+ * @param {number} t - Position between them, 0 (a) to 1 (b).
+ * @returns {number[]} Interpolated [r, g, b], rounded to integers.
+ */
 const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+/**
+ * Diverging red-white-green colour for a score percentile.
+ * @param {number} p - Percentile in [0, 1]: 0 is red, 0.5 white, 1 green.
+ * @returns {number[]} [r, g, b].
+ */
 const scoreColor = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p - 0.5) * 2);
 const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
   .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
 const EXCLUDED = [110, 116, 128, 70];
+/**
+ * Decile a score percentile falls in.
+ * @param {number} p - Percentile in [0, 1].
+ * @returns {number} Decile index 0-9 (a percentile of 1 counts as decile 9).
+ */
 const decile = p => Math.min(9, Math.floor(p * 10));
-// highlight = hovered cluster (cluster mode) or decile (score mode); everything else fades.
+/**
+ * Fill colour of a zone on the map.
+ * highlight = hovered cluster (cluster mode) or decile (score mode); everything else fades.
+ * @param {?number} v - The zone's value: cluster id (cluster mode), score percentile (score mode) or null if excluded.
+ * @returns {number[]} [r, g, b, a]: grey for excluded zones, a categorical colour per cluster or the score colour,
+ *   faded when another cluster or decile is highlighted.
+ */
 const color = v => {
   if (v === null) return highlight === null ? EXCLUDED : [...EXCLUDED.slice(0, 3), 15];
   const group = mode === 'cluster' ? v : decile(v);
@@ -175,6 +198,10 @@ const map = new deck.DeckGL({
   },
 });
 
+/**
+ * Redraw the map and everything derived from the current values: the cluster legend, the cluster profile
+ * table, the decile scale and the excluded-zone count.
+ */
 function render() {
   map.setProps({ layers: [new deck.PolygonLayer({
     id: 'cells', data: cells,
@@ -196,7 +223,10 @@ function render() {
   if (n) n.textContent = `${excludedCount.toLocaleString()} of ${vals.length.toLocaleString()} excluded`;
 }
 
-// Cluster profiles: rows = switched-on features, columns = clusters, cell = centre percentile (50 = London median).
+/**
+ * Draw the cluster profile table (cluster mode only, hidden otherwise).
+ * Rows = switched-on features, columns = clusters, cell = centre percentile (50 = London median).
+ */
 function renderProfile() {
   const el = document.getElementById('profile');
   el.hidden = mode !== 'cluster' || !profile || !profile.keys.length;
@@ -211,7 +241,10 @@ function renderProfile() {
       return `<td data-c="${c}"${dim(c)} style="background:rgb(${scoreColor(v / 100)});color:${Math.abs(v - 50) > 30 ? '#fff' : '#111'}">${Math.round(v)}</td>`;
     }).join('') + '</tr>'; }).join('') + '</table>';
 }
-// Decile scale (score mode): one row per decile, top = best, with the number of zones in each.
+/**
+ * Draw the decile scale (score mode only, hidden otherwise).
+ * One row per decile, top = best, with the number of zones in each.
+ */
 function renderDeciles() {
   const el = document.getElementById('deciles');
   el.hidden = mode !== 'score';
@@ -230,10 +263,21 @@ function renderDeciles() {
   el.addEventListener('mouseover', e => { const c = e.target.closest('[data-c]'); setHighlight(c ? +c.dataset.c : null); });
   el.addEventListener('mouseleave', () => setHighlight(null));
 });
+/**
+ * Highlight one cluster or decile on the map, fading the others. Re-renders only if it changed.
+ * @param {?number} c - Cluster id (cluster mode) or decile 0-9 (score mode), or null to clear the highlight.
+ */
 function setHighlight(c) { if (c !== highlight) { highlight = c; render(); } }
 
 // Latest-wins request coalescing: never more than one request in flight.
 let inflight = false, queued = false;
+/**
+ * Ask the backend for the zone values under the current sidebar settings.
+ * Sends the switched-on feature weights, enabled exclusion thresholds and number of clusters.
+ * @param {string} level - Zone level key.
+ * @param {string} mode - 'score' or 'cluster'.
+ * @returns {Promise<Object>} The /score response ({pct, excluded}) or the /cluster response ({labels, keys, centers, excluded}).
+ */
 async function fetchValues(level, mode) {
   const weights = Object.fromEntries(Object.entries(state).filter(([, s]) => s.on).map(([k, s]) => [k, s.w]));
   const n_clusters = +document.getElementById('k').value;
@@ -244,7 +288,18 @@ async function fetchValues(level, mode) {
   });
   return r.json();
 }
+/**
+ * Store a backend response as the current zone values, and bump the version so the map recolours.
+ * @param {string} m - Mode the response was computed for: 'score' or 'cluster'.
+ * @param {Object} j - Response from fetchValues().
+ */
 function apply(m, j) { vals = m === 'cluster' ? j.labels : j.pct; profile = m === 'cluster' ? j : null; excludedCount = j.excluded; version++; }
+/**
+ * Recompute the zone values after a sidebar change and redraw.
+ * Calls made while a request is in flight are coalesced into one follow-up request. A response is dropped
+ * if the level or mode changed while it was in flight.
+ * @returns {Promise<void>}
+ */
 async function update() {
   if (inflight) { queued = true; return; }
   inflight = true;
@@ -254,6 +309,11 @@ async function update() {
   if (queued) { queued = false; update(); }
 }
 
+/**
+ * Rebuild the parameters sidebar from the current state: a switch and threshold slider per hard exclusion,
+ * then a switch and weight slider per feature, under their group headings. Each control updates the state
+ * and calls update().
+ */
 function buildSidebar() {
   const el = document.getElementById('features'); el.innerHTML = '';
   el.insertAdjacentHTML('beforeend', `<h2>Hard exclusions<span class="count" id="excl-count"></span></h2>`);
@@ -284,6 +344,11 @@ function buildSidebar() {
   });
 }
 
+/**
+ * Reset every feature and exclusion, then rebuild the sidebar and recompute.
+ * @param {boolean} clear - If true, switch everything off (weights 0.5). If false, restore the default weights
+ *   from /meta and enable every exclusion at 100% coverage.
+ */
 function setDefaults(clear) {
   features.forEach(f => state[f.key] = { on: !clear && f.default != null, w: clear ? 0.5 : (f.default ?? 0.5) });
   exclusions.forEach(x => excl[x.key] = { on: !clear, t: 1 });
@@ -293,7 +358,11 @@ function setDefaults(clear) {
 document.getElementById('reset').onclick = () => setDefaults(false);
 document.getElementById('clear').onclick = () => setDefaults(true);
 
-// Every sidebar parameter as YAML (labels are double-quoted, which is valid YAML).
+/**
+ * Every sidebar parameter as YAML (labels are double-quoted, which is valid YAML).
+ * This is the export format, also sent to the chat agent as the user's current config.
+ * @returns {string} YAML with zones, mode, n_clusters, hard_exclusions and features.
+ */
 function configYaml() {
   const q = JSON.stringify;
   return [
@@ -316,6 +385,14 @@ document.getElementById('export').onclick = () => {
 };
 
 // Load a config exported above: anything the file doesn't mention is switched off.
+/**
+ * Coerce a value to a number within a range.
+ * @param {*} v - Value to coerce.
+ * @param {number} lo - Minimum.
+ * @param {number} hi - Maximum.
+ * @param {number} dflt - Returned when v isn't a finite number.
+ * @returns {number} v clamped to [lo, hi], or dflt.
+ */
 const clamp = (v, lo, hi, dflt) => Number.isFinite(+v) ? Math.min(hi, Math.max(lo, +v)) : dflt;
 document.getElementById('load').onclick = () => document.getElementById('load-file').click();
 document.getElementById('load-file').onchange = async e => {
@@ -326,6 +403,12 @@ document.getElementById('load-file').onchange = async e => {
   try { cfg = jsyaml.load(await file.text()) || {}; } catch (err) { alert(`Could not read ${file.name}:\n${err.message}`); return; }
   applyConfig(cfg);
 };
+/**
+ * Load a config (from a file or from the chat agent) into the sidebar and the map.
+ * Anything the config doesn't mention is switched off, and out-of-range numbers are clamped.
+ * @param {Object} cfg - Parsed config in the export format (see configYaml()).
+ * @returns {Promise<void>} Resolves once the level and mode are switched and the values are recomputed.
+ */
 async function applyConfig(cfg) {
   features.forEach(f => {
     const c = cfg.features?.[f.key];
@@ -355,6 +438,12 @@ const STEPS = {   // tool -> [shown while it runs, listed once done, in the one-
 };
 const SUGGESTIONS = ['Family homes near schools and green space, away from flood risk',
   'Best MSOA candidates for the BIL Fund', 'Group boroughs into 4 clusters by amenities'];
+/**
+ * Append a message to the chat log and scroll to it.
+ * @param {string} cls - Message kind: '' (agent; **bold** is rendered), 'user', 'step' or 'err'.
+ * @param {string} text - Message text, inserted as plain text.
+ * @returns {HTMLDivElement} The new message element.
+ */
 function chatLine(cls, text) {
   const el = document.createElement('div');
   el.className = `msg ${cls}`; el.textContent = text;
@@ -362,6 +451,9 @@ function chatLine(cls, text) {
   chatLog.appendChild(el); chatLog.scrollTop = chatLog.scrollHeight;
   return el;
 }
+/**
+ * Show the chat's opening hint and the suggested prompts; clicking a suggestion sends it.
+ */
 function chatIntro() {
   chatLine('step', 'Describe what you want to see. The agent investigates the data, picks parameters and loads them into the map.');
   const box = document.createElement('div');
@@ -374,7 +466,14 @@ function chatIntro() {
   }
   chatLog.appendChild(box);
 }
-// One line per agent turn: the current step with a timer while it runs, then a summary of the steps (expandable).
+/**
+ * Add the activity line for one agent turn to the chat log.
+ * One line per agent turn: the current step with a timer while it runs, then a summary of the steps (expandable).
+ * @returns {{tool: function(string): void, note: function(string): void, finish: function(boolean): void}}
+ *   tool(name) records a tool call; note(text) adds a line to the expandable list; finish(failed) stops the
+ *   timer and shows the summary, or 'Stopped' if failed. finish() removes the line if no tool was used, and
+ *   does nothing if called again.
+ */
 function activity() {
   const el = document.createElement('details');
   el.className = 'activity running';
@@ -398,7 +497,13 @@ function activity() {
     },
   };
 }
-// ['describe_data', 'preview_config', 'preview_config', 'apply_config'] -> "Looked at the data, tested 2 configurations and updated the map"
+/**
+ * One-sentence summary of the tools an agent turn used, in order of first use.
+ * @example summarise(['describe_data', 'preview_config', 'preview_config', 'apply_config'])
+ *   // -> "Looked at the data, tested 2 configurations and updated the map"
+ * @param {string[]} tools - Tool names in call order; must not be empty.
+ * @returns {string} The summary, capitalised, without a final full stop.
+ */
 function summarise(tools) {
   const counts = new Map();
   for (const t of tools) counts.set(t, (counts.get(t) || 0) + 1);
@@ -407,7 +512,12 @@ function summarise(tools) {
   const text = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}` : parts[0];
   return text[0].toUpperCase() + text.slice(1);
 }
-// Both sidebars (#params, #chat) collapse to a button on the map (#<id>-open); each one's state is remembered.
+/**
+ * Open or collapse a sidebar, and remember the choice in localStorage.
+ * Both sidebars (#params, #chat) collapse to a button on the map (#<id>-open); each one's state is remembered.
+ * @param {string} id - Sidebar element id: 'params' or 'chat'.
+ * @param {boolean} open - True to show the sidebar, false to collapse it to its button.
+ */
 function showPanel(id, open) {
   document.getElementById(id).hidden = !open; document.getElementById(`${id}-open`).hidden = open;
   try { localStorage.setItem(`${id}-open`, open ? '1' : '0'); } catch {}
@@ -467,7 +577,17 @@ document.getElementById('basemap').onclick = e => {
 
 // Swap cells, raw values and scores in one go so the map never shows a mismatched frame.
 // A zone can have several polygons (e.g. boroughs split by the Thames); each points back to its zone index i.
+/**
+ * One map polygon per zone part.
+ * @param {Array<{id: string, polys: number[][][]}>} zones - Zones from /meta.
+ * @returns {Array<{id: string, poly: number[][], i: number}>} Polygons, each with its zone id and zone index i.
+ */
 const flatten = zones => zones.flatMap((z, i) => z.polys.map(poly => ({ id: z.id, poly, i })));
+/**
+ * Switch the map to another zone level, loading its geometry and values in parallel before swapping them in.
+ * @param {string} l - Zone level key, e.g. 'h3_8' or 'boroughs'.
+ * @returns {Promise<void>}
+ */
 async function setLevel(l) {
   const [m, j] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchValues(l, mode)]);
   level = l; raw = m.raw; cov = m.cov; cells = flatten(m.cells); apply(mode, j);
@@ -475,6 +595,12 @@ async function setLevel(l) {
   render();
 }
 
+/**
+ * Switch between score and cluster mode: fetch the new values, then update the toolbar, legend and description.
+ * Clears any highlight.
+ * @param {string} m - 'score' or 'cluster'.
+ * @returns {Promise<void>}
+ */
 async function setMode(m) {
   const j = await fetchValues(level, m);
   mode = m; highlight = null; apply(m, j);

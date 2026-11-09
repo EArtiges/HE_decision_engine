@@ -19,6 +19,11 @@ SOURCES = {
 
 
 def main():
+    """Download each page in ``SOURCES`` from the GOV.UK content API and save it to docs/<id>.md.
+
+    Each file has YAML front matter (id, title, url, updated date, summary, licence) followed by the page title
+    and body converted to Markdown. Prints the word count of each document.
+    """
     DOCS.mkdir(exist_ok=True)
     for doc_id, slug in SOURCES.items():
         with urlopen(f"https://www.gov.uk/api/content/{slug}", timeout=60) as r:

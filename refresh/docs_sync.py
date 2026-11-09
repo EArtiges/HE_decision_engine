@@ -25,7 +25,16 @@ SOURCES = {
 
 
 def fetch(doc_id, slug):
-    """GOV.UK page -> Markdown with front matter."""
+    """GOV.UK page -> Markdown with front matter.
+
+    Args:
+        doc_id: Document id written to the front matter, e.g. ``"bil-fund"``.
+        slug: GOV.UK path, e.g. ``"guidance/brownfield-infrastructure-and-land-fund"``.
+
+    Returns:
+        The document as Markdown: front matter (id, title, url, updated date, summary, licence), then the
+        title as a heading and the page body.
+    """
     with urlopen(f"https://www.gov.uk/api/content/{slug}", timeout=60) as r:
         page = json.load(r)
     meta = {"id": doc_id, "title": page["title"], "url": f"https://www.gov.uk/{slug}",
@@ -37,6 +46,14 @@ def fetch(doc_id, slug):
 
 
 def vector_store(openai):
+    """The programme documents vector store, created if it doesn't exist yet.
+
+    Args:
+        openai: The Foundry project's OpenAI client.
+
+    Returns:
+        The first vector store named ``VECTOR_STORE``, or a new empty one.
+    """
     for store in openai.vector_stores.list():
         if store.name == VECTOR_STORE:
             return store
@@ -44,12 +61,30 @@ def vector_store(openai):
 
 
 def remove(openai, store, file):
+    """Detach a file from the vector store, then delete the file itself.
+
+    Args:
+        openai: The Foundry project's OpenAI client.
+        store: The vector store.
+        file: The vector store file to remove.
+    """
     openai.vector_stores.files.delete(file.id, vector_store_id=store.id)
     openai.files.delete(file.id)
 
 
 def sync():
-    """Brings the vector store in line with SOURCES; returns what changed per document."""
+    """Brings the vector store in line with SOURCES; returns what changed per document.
+
+    Changed documents are uploaded before their old versions are removed, so a document never drops out of
+    search. Files are named ``<doc id>--<content hash>.md``, which is how unchanged documents are detected.
+
+    Returns:
+        Dict with the ``vector_store`` id and ``documents``: doc id -> ``"added"``, ``"updated"``,
+        ``"unchanged"`` or ``"removed"``.
+
+    Raises:
+        RuntimeError: If the vector store fails to index an uploaded document.
+    """
     with DefaultAzureCredential() as credential, AIProjectClient(endpoint=ENDPOINT, credential=credential) as project:
         openai = project.get_openai_client()
         store = vector_store(openai)

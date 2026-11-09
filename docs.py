@@ -16,10 +16,28 @@ STOPWORDS = set("a an and are as at be by can for from has have how if in is it 
 
 
 def tokens(text):
+    """Split text into search terms.
+
+    Args:
+        text: Any text.
+
+    Returns:
+        Lowercase alphanumeric words of ``text``, in order, without ``STOPWORDS``.
+    """
     return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS]
 
 
 def load():
+    """Read the Markdown documents in docs/ and split them into search chunks.
+
+    Each section under a heading becomes a chunk, split into windows of ``MAX_WORDS`` words that overlap by
+    ``OVERLAP`` words when it is long. Sections shorter than ``MIN_WORDS`` are carried into the next section.
+
+    Returns:
+        A ``(docs, chunks)`` tuple. ``docs`` holds each document's front matter (as strings) plus its word
+        count. ``chunks`` holds dicts with the ``document`` id, ``title``, ``url``, ``section`` (heading path
+        below the title, or ``"Introduction"``) and ``text``.
+    """
     docs, chunks = [], []
     for path in sorted(DOCS.glob("*.md")):
         _, front, body = path.read_text().split("---", 2)
@@ -28,6 +46,12 @@ def load():
         headings, text = [], []
 
         def flush(force=False):
+            """Turn the text gathered since the last heading into chunks, then clear it.
+
+            Args:
+                force: Emit chunks even if the text is shorter than ``MIN_WORDS`` (used at the end of a
+                    document). Otherwise short text is kept and carried into the next section.
+            """
             words = " ".join(text).split()
             if len(words) < MIN_WORDS and not force:
                 return  # too short to stand alone (e.g. contact details): carried into the next section
@@ -61,7 +85,18 @@ DF = Counter(t for toks in TOKENS for t in set(toks))
 
 
 def search(query, document=None, top_k=5, k1=1.5, b=0.75):
-    """BM25 over chunks, optionally restricted to one document id."""
+    """BM25 over chunks, optionally restricted to one document id.
+
+    Args:
+        query: Search text.
+        document: Document id to search in, or None to search every document.
+        top_k: Maximum number of results.
+        k1: BM25 term-frequency saturation.
+        b: BM25 length normalisation (0 = none, 1 = full).
+
+    Returns:
+        Up to ``top_k`` chunks with a positive score, best first, each with its ``score`` rounded to 2 decimals.
+    """
     q = tokens(query)
     scored = []
     for chunk, toks in zip(CHUNKS, TOKENS):
